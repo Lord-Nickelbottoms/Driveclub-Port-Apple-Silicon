@@ -232,3 +232,4 @@ DerivedData/
 # 11. Private local notes and test captures (never pushed)
 # ------------------------------------------------------------------------------
 /private/
+tests/*.inc

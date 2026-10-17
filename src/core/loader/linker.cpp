@@ -8,6 +8,7 @@
 
 #include "common/log.h"
 #include "core/address_space.h"
+#include "core/fs_patcher.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "core/tls.h"
@@ -295,6 +296,19 @@ void Linker::RelocateModule(Module& m) {
 void Linker::Relocate() {
     for (auto& m : modules) {
         RelocateModule(*m);
+    }
+    // Without an FS segment (Rosetta 2), guest code reads its TCB through GS
+    // instead; rewrite the FS accesses while the images are still writable.
+    if (Tls::GetMode() == Tls::Mode::Patched) {
+        FsPatch::Stats total;
+        for (auto& m : modules) {
+            const FsPatch::Stats st = FsPatch::PatchRange(m->CodeBegin(), m->CodeEnd());
+            total.in_place += st.in_place;
+            total.trampolines += st.trampolines;
+            total.unsupported += st.unsupported;
+        }
+        DC_INFO("fs patcher: %llu in place, %llu via trampoline, %llu unsupported", total.in_place,
+                total.trampolines, total.unsupported);
     }
     for (auto& m : modules) {
         m->Protect();

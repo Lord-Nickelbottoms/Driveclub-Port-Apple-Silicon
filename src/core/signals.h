@@ -23,6 +23,11 @@ void Install(AddressDescriber describer);
 // reach). `area` must be mapped RWX and within 2 GB of the code.
 void AddPatchArea(VAddr code_begin, VAddr code_end, VAddr area, u64 area_size);
 
+// Carves `size` bytes of executable trampoline space from the patch area that
+// covers `near_site` (a code address). Returns nullptr when the area is full or
+// none covers the address. Used by the FS patcher at load time.
+u8* AllocTrampoline(VAddr near_site, u64 size);
+
 // Runs first on SIGSEGV/SIGBUS with the ucontext_t* and the fault address;
 // returning true resumes the faulting code (the GPU renderer write-watches
 // guest pages this way).

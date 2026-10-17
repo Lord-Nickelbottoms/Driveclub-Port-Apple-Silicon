@@ -17,18 +17,53 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# PS4 code runs natively, so the host must be x86_64 (Intel Mac).
+# PS4 code runs natively, so the host process must be x86_64: a real Intel Mac, or
+# an Apple Silicon Mac running this x86_64 build under Rosetta 2.
 set(CMAKE_OSX_ARCHITECTURES x86_64)
+
+execute_process(COMMAND sysctl -n hw.optional.arm64
+                OUTPUT_VARIABLE DC_HW_ARM64 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if (DC_HW_ARM64 STREQUAL "1")
+    set(DC_APPLE_SILICON TRUE)
+    message(STATUS "Apple Silicon host: building x86_64 for Rosetta 2")
+    # Libraries must be x86_64 too, so use the Intel Homebrew in /usr/local (install it and
+    # the dependencies through `arch -x86_64`, see README, "Apple Silicon").
+    if (EXISTS /usr/local/Homebrew)
+        list(PREPEND CMAKE_PREFIX_PATH /usr/local)
+        # Keep find_package from picking up the arm64 libraries in /opt/homebrew.
+        list(APPEND CMAKE_IGNORE_PREFIX_PATH /opt/homebrew)
+    else()
+        message(WARNING "No Intel Homebrew in /usr/local: SDL3 from /opt/homebrew is arm64 and "
+                        "will not link into this x86_64 build (see README, Apple Silicon)")
+    endif()
+endif()
+
+# Instruction-set baseline for our own code. -march=native is wrong here: on Apple
+# Silicon it names an arm64 CPU, and Rosetta 2 only guarantees SSE4.2 (plus AVX/AVX2
+# on macOS 15 and later), so the default there is x86-64-v2.
+if (DC_APPLE_SILICON)
+    set(DC_HOST_MARCH_DEFAULT x86-64-v2)
+else()
+    set(DC_HOST_MARCH_DEFAULT native)
+endif()
+set(DC_HOST_MARCH ${DC_HOST_MARCH_DEFAULT} CACHE STRING
+    "-march= value for Release builds (x86-64-v2, x86-64-v3, native, ...)")
 
 find_package(SDL3 REQUIRED CONFIG)
 
+# Zydis: the FS patcher (src/core/fs_patcher.cpp) decodes guest code with it.
+include(cmake/Zydis.cmake)
+
 add_executable(driveclub
     src/main.mm
+    src/common/host.h
     src/common/log.h
     src/common/sha1.h
     src/common/types.h
     src/core/address_space.cpp
     src/core/address_space.h
+    src/core/fs_patcher.cpp
+    src/core/fs_patcher.h
     src/core/loader/elf_types.h
     src/core/loader/linker.cpp
     src/core/loader/linker.h
@@ -115,7 +150,7 @@ target_include_directories(driveclub PRIVATE src)
 target_compile_options(driveclub PRIVATE
     -Wall -Wextra -Wno-unused-parameter
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
-    $<$<CONFIG:Release>:-O3 -march=native>
+    $<$<CONFIG:Release>:-O3 -march=${DC_HOST_MARCH}>
 )
 
 # Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
@@ -147,6 +182,7 @@ endif()
 
 target_link_libraries(driveclub PRIVATE
     SDL3::SDL3
+    Zydis
     "-framework Metal"
     "-framework QuartzCore"
     "-framework Foundation"

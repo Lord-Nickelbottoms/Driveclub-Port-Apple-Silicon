@@ -38,7 +38,8 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the 
 
 ## Requirements
 
-- Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M)
+- Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M), or an Apple Silicon Mac
+  running the x86_64 build under Rosetta 2 (see [Apple Silicon](#apple-silicon))
 - Xcode, CMake >= 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
 - Your own copy of the game as a decrypted dump (fSELF/fPKG)
 
@@ -49,6 +50,41 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ./build/driveclub
 ```
+
+### Apple Silicon
+
+PS4 code is x86-64, so the process has to be x86_64 even on an M-series Mac; Rosetta 2 then
+translates the game's code (and ours) to arm64. Nothing about the build is arm64.
+
+1. Install the Intel Homebrew next to the native one, and the dependencies through it:
+
+   ```bash
+   arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   arch -x86_64 /usr/local/bin/brew install cmake ninja sdl3
+   ```
+
+2. Configure and build as x86_64 (CMake detects Apple Silicon, uses `/usr/local`, and defaults
+   to `-march=x86-64-v2`, the baseline Rosetta guarantees):
+
+   ```bash
+   arch -x86_64 /usr/local/bin/cmake -S . -B build -G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64
+   arch -x86_64 /usr/local/bin/cmake --build build
+   ./build/driveclub <game_dir>
+   ```
+
+   Pass `-DDC_HOST_MARCH=x86-64-v3` to allow AVX2 on macOS 15 or later.
+
+What differs from an Intel Mac:
+
+- **Guest TLS.** Rosetta has no LDT (`i386_set_ldt`), so FS cannot be pointed at the TCB. At load
+  time `src/core/fs_patcher.cpp` rewrites the guest's `fs:` accesses to go through GS, which
+  addresses the pthread TSD array: `fs:[0]` and `fs:[0x28]` (TCB pointer, stack canary) keep their
+  length and just read a TSD slot; other offsets jump to a small trampoline. The load log prints
+  `fs patcher: N in place, N via trampoline, N unsupported`; anything unsupported is warned about.
+  `DC_TLS=ldt|patch` forces a mode (native Intel keeps the LDT path by default).
+- **TSC.** Rosetta emulates `rdtsc`, so the TSC frequency is measured at startup instead of read
+  from `machdep.tsc.frequency`.
+- **GPU memory.** Unified memory is used as such: textures are `Shared`, not `Managed`.
 
 ### Vulkan renderer
 

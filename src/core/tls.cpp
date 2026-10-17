@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
+#include "common/host.h"
 #include "common/log.h"
 
 // Low memory for the LDT segments: a descriptor base is only 32 bits wide.
@@ -40,6 +41,16 @@ u32 g_max_index = 0;
 std::vector<u16> g_free_ldt;
 pthread_key_t g_state_key;
 
+Mode g_mode = Mode::Ldt;
+// Patched mode: TSD keys whose per-thread slot the rewritten guest code reads
+// through GS (the GS base is the pthread TSD array, slot n at offset 8 * n).
+pthread_key_t g_tcb_key, g_canary_key, g_scratch_key;
+constexpr pthread_key_t kMaxDirectKey = 512; // keys below this are addressable as gs:[8 * key]
+
+u32 SlotOffset(pthread_key_t key) {
+    return static_cast<u32>(key * sizeof(void*));
+}
+
 u64 StaticSize() {
     const ModuleTls& exe = g_modules[1];
     return exe.memsz ? AlignUp(exe.memsz, std::max<u64>(exe.align, 16)) : 0;
@@ -48,6 +59,25 @@ u64 StaticSize() {
 void InitOnce() {
     static std::once_flag once;
     std::call_once(once, [] {
+        // Rosetta 2 has no LDT; native Intel keeps the hardware path.
+        g_mode = Host::RunningUnderRosetta() ? Mode::Patched : Mode::Ldt;
+        if (const char* want = std::getenv("DC_TLS")) {
+            if (std::strcmp(want, "patch") == 0) {
+                g_mode = Mode::Patched;
+            } else if (std::strcmp(want, "ldt") == 0) {
+                g_mode = Mode::Ldt;
+            }
+        }
+        DC_INFO("guest TLS: %s", g_mode == Mode::Patched ? "patched fs accesses (GS/TSD slots)"
+                                                         : "LDT segment");
+        if (g_mode == Mode::Patched) {
+            for (pthread_key_t* key : {&g_tcb_key, &g_canary_key, &g_scratch_key}) {
+                if (pthread_key_create(key, nullptr) != 0 || *key >= kMaxDirectKey) {
+                    DC_ERROR("cannot get a directly addressable pthread TSD slot (key %lu)", *key);
+                    std::abort();
+                }
+            }
+        }
         mmap(reinterpret_cast<void*>(kLdtRegionBase), kLdtRegionSize, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
         for (u16 i = 0; i < kLdtCount; ++i) {
@@ -105,6 +135,26 @@ void* AllocModuleBlock(u32 index) {
 
 } // namespace
 
+Mode GetMode() {
+    InitOnce();
+    return g_mode;
+}
+
+u32 TcbSlotOffset() {
+    InitOnce();
+    return SlotOffset(g_tcb_key);
+}
+
+u32 CanarySlotOffset() {
+    InitOnce();
+    return SlotOffset(g_canary_key);
+}
+
+u32 ScratchSlotOffset() {
+    InitOnce();
+    return SlotOffset(g_scratch_key);
+}
+
 void RegisterModule(u32 index, const ModuleTls& tls) {
     if (index == 0 || index > kMaxModules) {
         DC_ERROR("TLS index %u out of range", index);
@@ -140,7 +190,12 @@ Tcb* SetupThread() {
     tcb->dtv = dtv;
 
     auto* state = new ThreadState{tcb, block, 0};
-    state->ldt_index = InstallLdt(tcb);
+    if (g_mode == Mode::Ldt) {
+        state->ldt_index = InstallLdt(tcb);
+    } else {
+        pthread_setspecific(g_tcb_key, tcb);
+        pthread_setspecific(g_canary_key, reinterpret_cast<void*>(tcb->canary));
+    }
     pthread_setspecific(g_state_key, state);
     return tcb;
 }
@@ -155,7 +210,7 @@ void TeardownThread() {
     }
     std::free(state->tcb->dtv);
     std::free(state->block);
-    {
+    if (g_mode == Mode::Ldt) {
         std::scoped_lock lk(g_lock);
         g_free_ldt.push_back(state->ldt_index);
     }

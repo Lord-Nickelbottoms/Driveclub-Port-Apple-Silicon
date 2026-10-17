@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <x86intrin.h>
 
+#include "common/host.h"
 #include "hle/hle.h"
 #include "hle/kernel/kernel.h"
 
@@ -18,17 +19,42 @@ namespace {
 
 const u64 g_start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 
+// Measures how fast RDTSC counts against the monotonic clock. Under Rosetta 2
+// the instruction is emulated and its rate need not match any sysctl value (there
+// is no machdep.tsc.frequency on Apple Silicon), but guest code that reads the TSC
+// itself and divides by the frequency we report must see consistent numbers.
+u64 CalibrateTsc() {
+    const u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const u64 c0 = __rdtsc();
+    u64 t1;
+    do {
+        t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    } while (t1 - t0 < 20'000'000);
+    const u64 c1 = __rdtsc();
+    const u64 hz = static_cast<u64>(static_cast<unsigned __int128>(c1 - c0) * 1'000'000'000ull /
+                                    (t1 - t0));
+    return (hz + 500'000) / 1'000'000 * 1'000'000; // the true rate is a round MHz figure
+}
+
 u64 TscFrequency() {
     static const u64 freq = [] {
         u64 f = 0;
-        size_t size = sizeof(f);
-        if (sysctlbyname("machdep.tsc.frequency", &f, &size, nullptr, 0) != 0 || f == 0) {
-            f = 1000000000; // fall back to 1 GHz rather than divide by zero
+        if (!Host::RunningUnderRosetta()) {
+            size_t size = sizeof(f);
+            if (sysctlbyname("machdep.tsc.frequency", &f, &size, nullptr, 0) != 0) {
+                f = 0;
+            }
         }
-        return f;
+        if (f == 0) {
+            f = CalibrateTsc();
+        }
+        return f ? f : 1000000000; // never divide by zero
     }();
     return freq;
 }
+
+// Calibrate at startup rather than stalling the first guest thread that asks.
+[[maybe_unused]] const u64 g_tsc_frequency = TscFrequency();
 
 // FreeBSD clock ids -> host clocks.
 bool HostClock(int guest, clockid_t* out) {

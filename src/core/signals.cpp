@@ -215,6 +215,15 @@ void Handler(int sig, siginfo_t* info, void* raw) {
         Die(sig);
     }
 
+    if (sig == SIGSEGV && reinterpret_cast<u64>(info->si_addr) < 0x10000) {
+        for (int i = 0; i < 3; ++i) {
+            if (code[i] == 0x64) {
+                DC_ERROR("hint: FS-relative access that the FS patcher did not rewrite "
+                         "(see its warnings at load time)");
+                break;
+            }
+        }
+    }
     Describe(sig == SIGSEGV ? "segmentation fault" : "bus error", rip,
              reinterpret_cast<u64>(info->si_addr), rsp);
     Die(sig);
@@ -235,6 +244,21 @@ void Install(AddressDescriber describer) {
 
 void SetFaultHandler(FaultHandler handler) {
     g_fault_handler.store(handler, std::memory_order_release);
+}
+
+u8* AllocTrampoline(VAddr near_site, u64 size) {
+    std::scoped_lock lk(g_patch_lock);
+    for (PatchArea& a : g_areas) {
+        if (near_site >= a.code_begin && near_site < a.code_end) {
+            if (a.next + size > a.end) {
+                return nullptr;
+            }
+            u8* p = reinterpret_cast<u8*>(a.next);
+            a.next = AlignUp(a.next + size, 16);
+            return p;
+        }
+    }
+    return nullptr;
 }
 
 void AddPatchArea(VAddr code_begin, VAddr code_end, VAddr area, u64 area_size) {

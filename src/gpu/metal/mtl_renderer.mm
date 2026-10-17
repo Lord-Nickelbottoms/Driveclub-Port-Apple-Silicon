@@ -1565,7 +1565,10 @@ struct MetalRenderer::Impl {
         d.arrayLength = layers;
       }
       d.usage = MTLTextureUsageShaderRead;
-      d.storageMode = MTLStorageModeManaged;
+      // Managed needs explicit CPU<->GPU syncing on discrete GPUs only; on unified
+      // memory (Apple Silicon) Shared is the right mode and costs nothing.
+      d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared
+                                               : MTLStorageModeManaged;
       d.swizzle =
           MTLTextureSwizzleChannelsMake(Swizzle(swz), Swizzle(swz >> 3),
                                         Swizzle(swz >> 6), Swizzle(swz >> 9));
@@ -3472,7 +3475,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                                      width:f.width
                                     height:f.height
                                  mipmapped:NO];
-    d.storageMode = MTLStorageModeManaged;
+    // Managed only matters on discrete GPUs; unified memory wants Shared.
+    d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared
+                                            : MTLStorageModeManaged;
     d.usage = MTLTextureUsageShaderRead;
     src = [device newTextureWithDescriptor:d];
     [src replaceRegion:MTLRegionMake2D(0, 0, f.width, f.height)
