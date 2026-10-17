@@ -19,8 +19,14 @@ constexpr VAddr kSystemManagedMax = 0x7FFFFC000;
 constexpr VAddr kSystemReservedMin = 0x7FFFFC000;
 constexpr VAddr kSystemReservedMax = 0xFC0000000;
 // Direct and flexible memory mappings; games use fixed addresses from 64 GB up.
+// The upper bound sets the size of the GUEST_USER zero-fill segment the kernel maps
+// at exec time (about 105 TB by default); configurable with -DDC_GUEST_USER_MAX=...
+// in case a host (Rosetta 2) refuses a segment that large.
+#ifndef DC_GUEST_USER_MAX
+#define DC_GUEST_USER_MAX 0x600000000000
+#endif
 constexpr VAddr kUserMin = 0x1000000000;
-constexpr VAddr kUserMax = 0x600000000000;
+constexpr VAddr kUserMax = DC_GUEST_USER_MAX;
 
 enum class Prot : int { None = 0, Read = 1, Write = 2, Exec = 4, ReadWrite = 3 };
 

@@ -86,6 +86,11 @@ What differs from an Intel Mac:
   from `machdep.tsc.frequency`.
 - **GPU memory.** Unified memory is used as such: textures are `Shared`, not `Managed`.
 
+If the process is killed with no output at all, it died while the kernel was mapping the
+executable's fixed zero-fill segments (the 96 TB `GUEST_USER` one is the likely culprit under
+Rosetta). Rebuild with a smaller one, e.g. `-DDC_GUEST_USER_MAX=0x10000000000` (1 TB), and see
+`otool -l build/driveclub | grep -A9 GUEST` for what the binary requests.
+
 ### Vulkan renderer
 
 `src/gpu/vulkan` puts shadPS4's Vulkan renderer (`video_core` + `shader_recompiler`,

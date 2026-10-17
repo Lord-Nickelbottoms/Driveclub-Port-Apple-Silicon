@@ -153,6 +153,12 @@ target_compile_options(driveclub PRIVATE
     $<$<CONFIG:Release>:-O3 -march=${DC_HOST_MARCH}>
 )
 
+# End of the guest "user" range, which also sizes the GUEST_USER zero-fill segment
+# mapped at exec time. The default (96 TB) is what Intel Macs run with; lower it
+# (e.g. 0x10000000000 = 1 TB) if the process is killed before printing anything.
+set(DC_GUEST_USER_MAX 0x600000000000 CACHE STRING "End of the guest user address range")
+target_compile_definitions(driveclub PRIVATE DC_GUEST_USER_MAX=${DC_GUEST_USER_MAX})
+
 # Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
 # sit inside the default 4 GB __PAGEZERO. Shrink it, move our own image above
 # every guest range, and pin the zero-fill reservations from address_space.cpp
