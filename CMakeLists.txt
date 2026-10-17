@@ -153,11 +153,24 @@ target_compile_options(driveclub PRIVATE
     $<$<CONFIG:Release>:-O3 -march=${DC_HOST_MARCH}>
 )
 
-# End of the guest "user" range, which also sizes the GUEST_USER zero-fill segment
-# mapped at exec time. The default (96 TB) is what Intel Macs run with; lower it
-# (e.g. 0x10000000000 = 1 TB) if the process is killed before printing anything.
+# The guest "user" range (64 GB up) is mapped by the kernel at exec time as the huge
+# GUEST_USER zero-fill segment. Rosetta 2 reserves [0xFC0000000, 0x7000000000) in every
+# translated process, so there the segment makes exec fail (the process is killed before
+# main): the range is off by default on Apple Silicon. Guests then only get the system
+# managed and system reserved areas (0 to 63 GB), which is where default allocations go.
+if (DC_APPLE_SILICON)
+    set(DC_GUEST_USER_RANGE_DEFAULT OFF)
+else()
+    set(DC_GUEST_USER_RANGE_DEFAULT ON)
+endif()
+option(DC_GUEST_USER_RANGE "Reserve the guest user range (64 GB and up)" ${DC_GUEST_USER_RANGE_DEFAULT})
+# End of that range (96 TB by default, as on Intel Macs).
 set(DC_GUEST_USER_MAX 0x600000000000 CACHE STRING "End of the guest user address range")
-target_compile_definitions(driveclub PRIVATE DC_GUEST_USER_MAX=${DC_GUEST_USER_MAX})
+if (DC_GUEST_USER_RANGE)
+    target_compile_definitions(driveclub PRIVATE DC_GUEST_USER_MAX=${DC_GUEST_USER_MAX})
+else()
+    target_compile_definitions(driveclub PRIVATE DC_NO_GUEST_USER=1)
+endif()
 
 # Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
 # sit inside the default 4 GB __PAGEZERO. Shrink it, move our own image above
@@ -168,8 +181,10 @@ target_link_options(driveclub PRIVATE
     -Wl,-segaddr,GUEST_TCB,0x4000
     -Wl,-segaddr,GUEST_SYSMGD,0x400000
     -Wl,-segaddr,GUEST_SYSRSV,0x7FFFFC000
-    -Wl,-segaddr,GUEST_USER,0x1000000000
 )
+if (DC_GUEST_USER_RANGE)
+    target_link_options(driveclub PRIVATE -Wl,-segaddr,GUEST_USER,0x1000000000)
+endif()
 
 # Vulkan renderer (shadPS4's, third_party/shadps4): the Windows/Linux backend,
 # selectable on macOS too through MoltenVK with DC_RENDERER=vulkan.

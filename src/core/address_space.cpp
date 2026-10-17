@@ -8,9 +8,11 @@
 // Sizes are kMax - kMin of the matching range.
 asm(".zerofill GUEST_SYSMGD,GUEST_SYSMGD,__guest_sysmgd,0x7FFBFC000");
 asm(".zerofill GUEST_SYSRSV,GUEST_SYSRSV,__guest_sysrsv,0x7C0004000");
+#ifndef DC_NO_GUEST_USER
 #define DC_STR_(x) #x
 #define DC_STR(x) DC_STR_(x)
 asm(".zerofill GUEST_USER,GUEST_USER,__guest_user," DC_STR(DC_GUEST_USER_MAX) "-0x1000000000");
+#endif
 
 namespace Core::AddressSpace {
 
@@ -23,7 +25,9 @@ struct Range {
 constexpr Range kRanges[] = {
     {kSystemManagedMin, kSystemManagedMax},
     {kSystemReservedMin, kSystemReservedMax},
+#ifndef DC_NO_GUEST_USER
     {kUserMin, kUserMax},
+#endif
 };
 
 int ToHost(Prot prot) {

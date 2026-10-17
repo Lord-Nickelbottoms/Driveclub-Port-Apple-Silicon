@@ -86,10 +86,13 @@ What differs from an Intel Mac:
   from `machdep.tsc.frequency`.
 - **GPU memory.** Unified memory is used as such: textures are `Shared`, not `Managed`.
 
-If the process is killed with no output at all, it died while the kernel was mapping the
-executable's fixed zero-fill segments (the 96 TB `GUEST_USER` one is the likely culprit under
-Rosetta). Rebuild with a smaller one, e.g. `-DDC_GUEST_USER_MAX=0x10000000000` (1 TB), and see
-`otool -l build/driveclub | grep -A9 GUEST` for what the binary requests.
+Rosetta 2 reserves the 64-448 GB address range (`[0xFC0000000, 0x7000000000)`, no access) in
+every translated process, so the guest "user" range that starts at 64 GB cannot be mapped there:
+an executable that asks for it is killed by the kernel at exec, before `main`. On Apple Silicon
+`DC_GUEST_USER_RANGE` therefore defaults to OFF and the guest gets the 0-63 GB system areas only,
+where default allocations are placed (from 8 GB). If the game requests fixed addresses at 64 GB
+or above, the loader reports `guest map ... is outside the reserved ranges` with the address.
+Check what the binary asks for with `otool -l build/driveclub | grep -A3 "segname GUEST"`.
 
 ### Vulkan renderer
 
