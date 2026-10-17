@@ -1,6 +1,7 @@
 #include "core/fs_patcher.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -277,11 +278,22 @@ Stats PatchRange(VAddr begin, VAddr end) {
             ++st.trampolines;
             break;
         }
-        case Kind::Unsupported:
-            DC_WARN("fs patcher: %s at %#llx (%02x %02x %02x %02x %02x %02x %02x %02x)", r.reason,
-                    a, code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
+        case Kind::Unsupported: {
+            // The executable segment of a PS4 module also holds read-only data, which this
+            // linear sweep decodes as code: bytes such as 'd' (0x64) in strings look like
+            // FS prefixes. Most of these hits are therefore data, so only the first few are
+            // listed (all of them with DC_FSPATCH_VERBOSE=1).
+            static const bool verbose = std::getenv("DC_FSPATCH_VERBOSE") != nullptr;
+            static int listed = 0;
+            if (verbose || listed < 8) {
+                ++listed;
+                DC_WARN("fs patcher: %s at %#llx (%02x %02x %02x %02x %02x %02x %02x %02x)",
+                        r.reason, a, code[0], code[1], code[2], code[3], code[4], code[5], code[6],
+                        code[7]);
+            }
             ++st.unsupported;
             break;
+        }
         }
         a += r.length;
     }

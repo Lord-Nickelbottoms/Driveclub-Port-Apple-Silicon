@@ -307,8 +307,9 @@ void Linker::Relocate() {
             total.trampolines += st.trampolines;
             total.unsupported += st.unsupported;
         }
-        DC_INFO("fs patcher: %llu in place, %llu via trampoline, %llu unsupported", total.in_place,
-                total.trampolines, total.unsupported);
+        DC_INFO("fs patcher: %llu in place, %llu via trampoline, %llu skipped (mostly data bytes "
+                "in the code segment; DC_FSPATCH_VERBOSE=1 lists them)",
+                total.in_place, total.trampolines, total.unsupported);
     }
     for (auto& m : modules) {
         m->Protect();
