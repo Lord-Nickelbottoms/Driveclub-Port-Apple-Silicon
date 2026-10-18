@@ -1,0 +1,69 @@
+From fbfba84661cfe728e86d601e3961a8ceb6b747f9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 17:54:17 +0000
+Subject: [PATCH] fs patcher: list only the first few skipped sites (most are
+ data in the code segment)
+
+---
+ src/core/fs_patcher.cpp    | 18 +++++++++++++++---
+ src/core/loader/linker.cpp |  5 +++--
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/fs_patcher.cpp b/src/core/fs_patcher.cpp
+index 1f5e991..77bad89 100644
+--- a/src/core/fs_patcher.cpp
++++ b/src/core/fs_patcher.cpp
+@@ -1,6 +1,7 @@
+ #include "core/fs_patcher.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <vector>
+ 
+@@ -277,12 +278,23 @@ Stats PatchRange(VAddr begin, VAddr end) {
+             ++st.trampolines;
+             break;
+         }
+-        case Kind::Unsupported:
+-            DC_WARN("fs patcher: %s at %#llx (%02x %02x %02x %02x %02x %02x %02x %02x)", r.reason,
+-                    a, code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
++        case Kind::Unsupported: {
++            // The executable segment of a PS4 module also holds read-only data, which this
++            // linear sweep decodes as code: bytes such as 'd' (0x64) in strings look like
++            // FS prefixes. Most of these hits are therefore data, so only the first few are
++            // listed (all of them with DC_FSPATCH_VERBOSE=1).
++            static const bool verbose = std::getenv("DC_FSPATCH_VERBOSE") != nullptr;
++            static int listed = 0;
++            if (verbose || listed < 8) {
++                ++listed;
++                DC_WARN("fs patcher: %s at %#llx (%02x %02x %02x %02x %02x %02x %02x %02x)",
++                        r.reason, a, code[0], code[1], code[2], code[3], code[4], code[5], code[6],
++                        code[7]);
++            }
+             ++st.unsupported;
+             break;
+         }
++        }
+         a += r.length;
+     }
+     return st;
+diff --git a/src/core/loader/linker.cpp b/src/core/loader/linker.cpp
+index af424af..93083fa 100644
+--- a/src/core/loader/linker.cpp
++++ b/src/core/loader/linker.cpp
+@@ -307,8 +307,9 @@ void Linker::Relocate() {
+             total.trampolines += st.trampolines;
+             total.unsupported += st.unsupported;
+         }
+-        DC_INFO("fs patcher: %llu in place, %llu via trampoline, %llu unsupported", total.in_place,
+-                total.trampolines, total.unsupported);
++        DC_INFO("fs patcher: %llu in place, %llu via trampoline, %llu skipped (mostly data bytes "
++                "in the code segment; DC_FSPATCH_VERBOSE=1 lists them)",
++                total.in_place, total.trampolines, total.unsupported);
+     }
+     for (auto& m : modules) {
+         m->Protect();
+-- 
+2.43.0
+

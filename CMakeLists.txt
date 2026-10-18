@@ -143,6 +143,8 @@ set(DC_CORE_SOURCES
     src/hle/nid_db.inc
 )
 
+add_executable(driveclub ${DC_CORE_SOURCES})
+
 if (DC_ARM64_HOST)
     target_sources(driveclub PRIVATE
         src/cpu/jit/arm64_backend.cpp

@@ -1,0 +1,1121 @@
+From 6fbe7f86ab2ccc133279826c396a6fd328973053 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 08:32:33 +0000
+Subject: [PATCH] Apple Silicon: run the x86_64 build under Rosetta 2
+
+- patch guest FS accesses to GS/TSD slots when there is no LDT (fs_patcher)
+- Rosetta-aware TLS mode selection (DC_TLS=ldt|patch)
+- x86-64-v2 baseline instead of -march=native on Apple Silicon, Intel Homebrew prefix
+- calibrate the TSC frequency instead of reading machdep.tsc.frequency
+- Shared instead of Managed textures on unified memory
+- Linux test harness for the FS patcher
+---
+ .gitignore                      |   1 +
+ CMakeLists.txt                  |  40 ++++-
+ README.md                       |  38 ++++-
+ cmake/Zydis.cmake               |  20 +++
+ src/common/host.h               |  21 +++
+ src/core/fs_patcher.cpp         | 291 ++++++++++++++++++++++++++++++++
+ src/core/fs_patcher.h           |  40 +++++
+ src/core/loader/linker.cpp      |  14 ++
+ src/core/signals.cpp            |  24 +++
+ src/core/signals.h              |   5 +
+ src/core/tls.cpp                |  59 ++++++-
+ src/core/tls.h                  |  23 ++-
+ src/gpu/metal/mtl_renderer.mm   |   9 +-
+ src/hle/kernel/time.cpp         |  34 +++-
+ tests/README.md                 |  13 ++
+ tests/fs_patcher_cases.py       |  28 +++
+ tests/fs_patcher_gen.py         |  15 ++
+ tests/fs_patcher_test_linux.cpp | 138 +++++++++++++++
+ 18 files changed, 799 insertions(+), 14 deletions(-)
+ create mode 100644 cmake/Zydis.cmake
+ create mode 100644 src/common/host.h
+ create mode 100644 src/core/fs_patcher.cpp
+ create mode 100644 src/core/fs_patcher.h
+ create mode 100644 tests/README.md
+ create mode 100644 tests/fs_patcher_cases.py
+ create mode 100644 tests/fs_patcher_gen.py
+ create mode 100644 tests/fs_patcher_test_linux.cpp
+
+diff --git a/.gitignore b/.gitignore
+index 4f1e6dd..f5623fb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -232,3 +232,4 @@ DerivedData/
+ # 11. Private local notes and test captures (never pushed)
+ # ------------------------------------------------------------------------------
+ /private/
++tests/*.inc
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d6e5af5..9845bf6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,18 +17,53 @@ if (NOT CMAKE_BUILD_TYPE)
+     set(CMAKE_BUILD_TYPE Release)
+ endif()
+ 
+-# PS4 code runs natively, so the host must be x86_64 (Intel Mac).
++# PS4 code runs natively, so the host process must be x86_64: a real Intel Mac, or
++# an Apple Silicon Mac running this x86_64 build under Rosetta 2.
+ set(CMAKE_OSX_ARCHITECTURES x86_64)
+ 
++execute_process(COMMAND sysctl -n hw.optional.arm64
++                OUTPUT_VARIABLE DC_HW_ARM64 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
++if (DC_HW_ARM64 STREQUAL "1")
++    set(DC_APPLE_SILICON TRUE)
++    message(STATUS "Apple Silicon host: building x86_64 for Rosetta 2")
++    # Libraries must be x86_64 too, so use the Intel Homebrew in /usr/local (install it and
++    # the dependencies through `arch -x86_64`, see README, "Apple Silicon").
++    if (EXISTS /usr/local/Homebrew)
++        list(PREPEND CMAKE_PREFIX_PATH /usr/local)
++        # Keep find_package from picking up the arm64 libraries in /opt/homebrew.
++        list(APPEND CMAKE_IGNORE_PREFIX_PATH /opt/homebrew)
++    else()
++        message(WARNING "No Intel Homebrew in /usr/local: SDL3 from /opt/homebrew is arm64 and "
++                        "will not link into this x86_64 build (see README, Apple Silicon)")
++    endif()
++endif()
++
++# Instruction-set baseline for our own code. -march=native is wrong here: on Apple
++# Silicon it names an arm64 CPU, and Rosetta 2 only guarantees SSE4.2 (plus AVX/AVX2
++# on macOS 15 and later), so the default there is x86-64-v2.
++if (DC_APPLE_SILICON)
++    set(DC_HOST_MARCH_DEFAULT x86-64-v2)
++else()
++    set(DC_HOST_MARCH_DEFAULT native)
++endif()
++set(DC_HOST_MARCH ${DC_HOST_MARCH_DEFAULT} CACHE STRING
++    "-march= value for Release builds (x86-64-v2, x86-64-v3, native, ...)")
++
+ find_package(SDL3 REQUIRED CONFIG)
+ 
++# Zydis: the FS patcher (src/core/fs_patcher.cpp) decodes guest code with it.
++include(cmake/Zydis.cmake)
++
+ add_executable(driveclub
+     src/main.mm
++    src/common/host.h
+     src/common/log.h
+     src/common/sha1.h
+     src/common/types.h
+     src/core/address_space.cpp
+     src/core/address_space.h
++    src/core/fs_patcher.cpp
++    src/core/fs_patcher.h
+     src/core/loader/elf_types.h
+     src/core/loader/linker.cpp
+     src/core/loader/linker.h
+@@ -115,7 +150,7 @@ target_include_directories(driveclub PRIVATE src)
+ target_compile_options(driveclub PRIVATE
+     -Wall -Wextra -Wno-unused-parameter
+     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+-    $<$<CONFIG:Release>:-O3 -march=native>
++    $<$<CONFIG:Release>:-O3 -march=${DC_HOST_MARCH}>
+ )
+ 
+ # Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
+@@ -147,6 +182,7 @@ endif()
+ 
+ target_link_libraries(driveclub PRIVATE
+     SDL3::SDL3
++    Zydis
+     "-framework Metal"
+     "-framework QuartzCore"
+     "-framework Foundation"
+diff --git a/README.md b/README.md
+index 618e461..cbf4432 100644
+--- a/README.md
++++ b/README.md
+@@ -38,7 +38,8 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the
+ 
+ ## Requirements
+ 
+-- Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M)
++- Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M), or an Apple Silicon Mac
++  running the x86_64 build under Rosetta 2 (see [Apple Silicon](#apple-silicon))
+ - Xcode, CMake >= 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
+ - Your own copy of the game as a decrypted dump (fSELF/fPKG)
+ 
+@@ -50,6 +51,41 @@ cmake --build build
+ ./build/driveclub
+ ```
+ 
++### Apple Silicon
++
++PS4 code is x86-64, so the process has to be x86_64 even on an M-series Mac; Rosetta 2 then
++translates the game's code (and ours) to arm64. Nothing about the build is arm64.
++
++1. Install the Intel Homebrew next to the native one, and the dependencies through it:
++
++   ```bash
++   arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
++   arch -x86_64 /usr/local/bin/brew install cmake ninja sdl3
++   ```
++
++2. Configure and build as x86_64 (CMake detects Apple Silicon, uses `/usr/local`, and defaults
++   to `-march=x86-64-v2`, the baseline Rosetta guarantees):
++
++   ```bash
++   arch -x86_64 /usr/local/bin/cmake -S . -B build -G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64
++   arch -x86_64 /usr/local/bin/cmake --build build
++   ./build/driveclub <game_dir>
++   ```
++
++   Pass `-DDC_HOST_MARCH=x86-64-v3` to allow AVX2 on macOS 15 or later.
++
++What differs from an Intel Mac:
++
++- **Guest TLS.** Rosetta has no LDT (`i386_set_ldt`), so FS cannot be pointed at the TCB. At load
++  time `src/core/fs_patcher.cpp` rewrites the guest's `fs:` accesses to go through GS, which
++  addresses the pthread TSD array: `fs:[0]` and `fs:[0x28]` (TCB pointer, stack canary) keep their
++  length and just read a TSD slot; other offsets jump to a small trampoline. The load log prints
++  `fs patcher: N in place, N via trampoline, N unsupported`; anything unsupported is warned about.
++  `DC_TLS=ldt|patch` forces a mode (native Intel keeps the LDT path by default).
++- **TSC.** Rosetta emulates `rdtsc`, so the TSC frequency is measured at startup instead of read
++  from `machdep.tsc.frequency`.
++- **GPU memory.** Unified memory is used as such: textures are `Shared`, not `Managed`.
++
+ ### Vulkan renderer
+ 
+ `src/gpu/vulkan` puts shadPS4's Vulkan renderer (`video_core` + `shader_recompiler`,
+diff --git a/cmake/Zydis.cmake b/cmake/Zydis.cmake
+new file mode 100644
+index 0000000..3e877c0
+--- /dev/null
++++ b/cmake/Zydis.cmake
+@@ -0,0 +1,20 @@
++# Zydis x86 decoder, for the guest FS patcher. Skipped when a Zydis target already
++# exists (the Vulkan renderer's cmake/ShadPS4Vulkan.cmake uses the same one).
++include_guard(GLOBAL)
++
++if (NOT TARGET Zydis)
++    include(FetchContent)
++    set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
++    set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
++    set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
++    FetchContent_Declare(dc_zydis
++        GIT_REPOSITORY https://github.com/zyantific/zydis.git
++        GIT_TAG v4.1.1
++        GIT_SHALLOW TRUE)
++    FetchContent_GetProperties(dc_zydis)
++    if (NOT dc_zydis_POPULATED)
++        message(STATUS "fetching Zydis v4.1.1")
++        FetchContent_Populate(dc_zydis)
++        add_subdirectory(${dc_zydis_SOURCE_DIR} ${dc_zydis_BINARY_DIR} EXCLUDE_FROM_ALL)
++    endif()
++endif()
+diff --git a/src/common/host.h b/src/common/host.h
+new file mode 100644
+index 0000000..e13b2d4
+--- /dev/null
++++ b/src/common/host.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++// Facts about the machine the (x86_64) host process is running on.
++
++#include <cstddef>
++
++#include <sys/sysctl.h>
++
++namespace Host {
++
++// True when this x86_64 process is being translated by Rosetta 2 on Apple Silicon.
++inline bool RunningUnderRosetta() {
++    static const bool translated = [] {
++        int value = 0;
++        size_t size = sizeof(value);
++        return sysctlbyname("sysctl.proc_translated", &value, &size, nullptr, 0) == 0 && value == 1;
++    }();
++    return translated;
++}
++
++} // namespace Host
+diff --git a/src/core/fs_patcher.cpp b/src/core/fs_patcher.cpp
+new file mode 100644
+index 0000000..1f5e991
+--- /dev/null
++++ b/src/core/fs_patcher.cpp
+@@ -0,0 +1,291 @@
++#include "core/fs_patcher.h"
++
++#include <algorithm>
++#include <cstring>
++#include <vector>
++
++#include <sys/mman.h>
++
++#include <Zydis/Zydis.h>
++
++#include "common/log.h"
++#include "core/signals.h"
++#include "core/tls.h"
++
++namespace Core::FsPatch {
++
++namespace {
++
++constexpr u64 kHostPage = 0x1000;
++constexpr s64 kCanaryDisp = 0x28; // Tls::Tcb::canary
++
++struct Slots {
++    u32 tcb;     // gs-relative offset of the slot holding the TCB pointer
++    u32 canary;  // ... holding the canary value
++    u32 scratch; // ... used to park the trampoline's scratch register
++};
++
++enum class Kind { None, InPlace, Trampoline, Unsupported };
++
++struct Rewrite {
++    Kind kind = Kind::None;
++    size_t length = 1;           // bytes the decoder consumed (1 on failure)
++    const char* reason = nullptr; // Unsupported only
++    std::vector<u8> bytes;       // InPlace: replacement; Trampoline: body before the jump back
++};
++
++bool IsLegacyPrefix(u8 b) {
++    switch (b) {
++    case 0xF0: case 0xF2: case 0xF3: case 0x2E: case 0x36: case 0x3E:
++    case 0x26: case 0x64: case 0x65: case 0x66: case 0x67:
++        return true;
++    default:
++        return false;
++    }
++}
++
++void Put32(std::vector<u8>& v, u32 x) {
++    for (int i = 0; i < 4; ++i) {
++        v.push_back(static_cast<u8>(x >> (8 * i)));
++    }
++}
++
++// mov gs:[off], r64     65 REX.W[R] 89 /r   (ModRM 00 reg 100, SIB 25 = disp32 only)
++void EmitStoreGs(std::vector<u8>& v, int reg, u32 off) {
++    v.push_back(0x65);
++    v.push_back(static_cast<u8>(0x48 | ((reg >> 3) << 2)));
++    v.push_back(0x89);
++    v.push_back(static_cast<u8>(((reg & 7) << 3) | 4));
++    v.push_back(0x25);
++    Put32(v, off);
++}
++
++// mov r64, gs:[off]     65 REX.W[R] 8B /r
++void EmitLoadGs(std::vector<u8>& v, int reg, u32 off) {
++    v.push_back(0x65);
++    v.push_back(static_cast<u8>(0x48 | ((reg >> 3) << 2)));
++    v.push_back(0x8B);
++    v.push_back(static_cast<u8>(((reg & 7) << 3) | 4));
++    v.push_back(0x25);
++    Put32(v, off);
++}
++
++Rewrite NoChange(size_t length) {
++    Rewrite r;
++    r.length = length;
++    return r;
++}
++
++Rewrite Unsupported(size_t length, const char* why) {
++    Rewrite r;
++    r.kind = Kind::Unsupported;
++    r.length = length;
++    r.reason = why;
++    return r;
++}
++
++// Decides how to rewrite the instruction at `code` (insn already decoded without
++// operands, known to carry an FS prefix).
++Rewrite Plan(const ZydisDecoder& dec, ZydisDecoderContext& ctx, const ZydisDecodedInstruction& insn,
++             const u8* code, const Slots& slots) {
++    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
++    if (!ZYAN_SUCCESS(ZydisDecoderDecodeOperands(&dec, &ctx, &insn, ops, insn.operand_count))) {
++        return NoChange(insn.length);
++    }
++
++    // The memory operand that really uses FS (a prefix on lea, nop, ... is ignored).
++    const ZydisDecodedOperand* mem = nullptr;
++    for (u8 i = 0; i < insn.operand_count; ++i) {
++        if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[i].mem.segment == ZYDIS_REGISTER_FS) {
++            mem = &ops[i];
++            break;
++        }
++    }
++    if (!mem || mem->mem.type != ZYDIS_MEMOP_TYPE_MEM) {
++        return NoChange(insn.length);
++    }
++
++    if (insn.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY) {
++        return Unsupported(insn.length, "VEX/EVEX/XOP-encoded FS access");
++    }
++    const bool absolute = mem->mem.base == ZYDIS_REGISTER_NONE &&
++                          mem->mem.index == ZYDIS_REGISTER_NONE && insn.raw.modrm.offset != 0 &&
++                          insn.raw.modrm.mod == 0 && insn.raw.modrm.rm == 4 &&
++                          insn.raw.sib.offset == insn.raw.modrm.offset + 1 &&
++                          insn.raw.sib.base == 5 && insn.raw.sib.index == 4 &&
++                          insn.raw.disp.size == 32 &&
++                          insn.raw.disp.offset == insn.raw.sib.offset + 1;
++    if (!absolute) {
++        return Unsupported(insn.length, "FS access with base/index register or moffs form");
++    }
++
++    // Locate the FS prefix, an optional REX and the opcode.
++    size_t p = 0;
++    size_t fs_pos = SIZE_MAX;
++    while (p < insn.length && IsLegacyPrefix(code[p])) {
++        if (code[p] == 0x64) {
++            fs_pos = p;
++        }
++        ++p;
++    }
++    if (fs_pos == SIZE_MAX || p >= insn.length) {
++        return Unsupported(insn.length, "FS prefix not found");
++    }
++    const size_t rex_pos = (code[p] & 0xF0) == 0x40 ? p : SIZE_MAX;
++    const size_t opcode_pos = rex_pos == SIZE_MAX ? p : p + 1;
++    const size_t modrm_pos = insn.raw.modrm.offset;
++    const size_t disp_pos = insn.raw.disp.offset;
++    if (opcode_pos >= modrm_pos) {
++        return Unsupported(insn.length, "unexpected instruction layout");
++    }
++
++    const s64 disp = mem->mem.disp.value;
++    const bool writes = (mem->actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0;
++
++    // Fast path: the TCB pointer and the canary have a slot of their own, so the
++    // instruction keeps its length and only swaps FS for GS.
++    if (!writes && mem->size <= 64 && (disp == 0 || disp == kCanaryDisp)) {
++        Rewrite r;
++        r.kind = Kind::InPlace;
++        r.length = insn.length;
++        r.bytes.assign(code, code + insn.length);
++        r.bytes[fs_pos] = 0x65;
++        const u32 off = disp == 0 ? slots.tcb : slots.canary;
++        std::memcpy(r.bytes.data() + disp_pos, &off, 4);
++        return r;
++    }
++
++    // General path: trampoline running the instruction on [scratch + disp32].
++    int scratch = -1;
++    for (int cand : {10, 11}) {
++        bool used = false;
++        for (u8 i = 0; i < insn.operand_count; ++i) {
++            if (ops[i].type != ZYDIS_OPERAND_TYPE_REGISTER) {
++                continue;
++            }
++            const ZydisRegister big =
++                ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, ops[i].reg.value);
++            used |= big == (cand == 10 ? ZYDIS_REGISTER_R10 : ZYDIS_REGISTER_R11);
++        }
++        if (!used) {
++            scratch = cand;
++            break;
++        }
++    }
++    if (scratch < 0) {
++        return Unsupported(insn.length, "no free scratch register");
++    }
++    if (rex_pos == SIZE_MAX) {
++        // Adding REX.B would turn ah/ch/dh/bh into spl/bpl/sil/dil.
++        for (u8 i = 0; i < insn.operand_count; ++i) {
++            if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++                (ops[i].reg.value == ZYDIS_REGISTER_AH || ops[i].reg.value == ZYDIS_REGISTER_CH ||
++                 ops[i].reg.value == ZYDIS_REGISTER_DH || ops[i].reg.value == ZYDIS_REGISTER_BH)) {
++                return Unsupported(insn.length, "high-byte register with FS access");
++            }
++        }
++    }
++
++    Rewrite r;
++    r.kind = Kind::Trampoline;
++    r.length = insn.length;
++    std::vector<u8>& b = r.bytes;
++    EmitStoreGs(b, scratch, slots.scratch);
++    EmitLoadGs(b, scratch, slots.tcb);
++    for (size_t i = 0; i < opcode_pos; ++i) { // prefixes, minus FS, REX gains B
++        if (i == fs_pos) {
++            continue;
++        }
++        b.push_back(i == rex_pos ? static_cast<u8>(code[i] | 0x01) : code[i]);
++    }
++    if (rex_pos == SIZE_MAX) {
++        b.push_back(0x41);
++    }
++    b.insert(b.end(), code + opcode_pos, code + modrm_pos);              // opcode bytes
++    b.push_back(static_cast<u8>(0x80 | (insn.raw.modrm.reg << 3) | (scratch & 7))); // [scratch+disp32]
++    b.insert(b.end(), code + disp_pos, code + insn.length);              // disp32 + immediates
++    EmitLoadGs(b, scratch, slots.scratch);
++    return r;
++}
++
++void WriteSite(u8* site, size_t length, const u8* tramp) {
++    const s64 rel = static_cast<s64>(reinterpret_cast<VAddr>(tramp)) -
++                    static_cast<s64>(reinterpret_cast<VAddr>(site) + 5);
++    site[0] = 0xE9;
++    const s32 rel32 = static_cast<s32>(rel);
++    std::memcpy(site + 1, &rel32, 4);
++    std::memset(site + 5, 0x90, length - 5);
++}
++
++} // namespace
++
++Stats PatchRange(VAddr begin, VAddr end) {
++    Stats st;
++    const Slots slots{Tls::TcbSlotOffset(), Tls::CanarySlotOffset(), Tls::ScratchSlotOffset()};
++
++    ZydisDecoder dec;
++    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
++
++    const VAddr page_begin = AlignDown(begin, kHostPage);
++    const VAddr page_end = AlignUp(end, kHostPage);
++    if (mprotect(reinterpret_cast<void*>(page_begin), page_end - page_begin,
++                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
++        DC_WARN("fs patcher: cannot make %#llx-%#llx writable", begin, end);
++    }
++
++    for (VAddr a = begin; a < end;) {
++        auto* code = reinterpret_cast<u8*>(a);
++        const size_t avail = std::min<VAddr>(end - a, 15);
++
++        ZydisDecoderContext ctx;
++        ZydisDecodedInstruction insn;
++        if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, &ctx, code, avail, &insn))) {
++            ++a; // data in code or a truncated tail: resynchronize
++            continue;
++        }
++        if (!(insn.attributes & ZYDIS_ATTRIB_HAS_SEGMENT_FS)) {
++            a += insn.length;
++            continue;
++        }
++
++        const Rewrite r = Plan(dec, ctx, insn, code, slots);
++        switch (r.kind) {
++        case Kind::None:
++            break;
++        case Kind::InPlace:
++            std::memcpy(code, r.bytes.data(), r.length);
++            ++st.in_place;
++            break;
++        case Kind::Trampoline: {
++            std::vector<u8> body = r.bytes;
++            const size_t total = body.size() + 5;
++            u8* tramp = Signals::AllocTrampoline(a, total);
++            if (!tramp) {
++                DC_ERROR("fs patcher: no trampoline space for %#llx", a);
++                ++st.unsupported;
++                break;
++            }
++            const s64 back = static_cast<s64>(a + r.length) -
++                             static_cast<s64>(reinterpret_cast<VAddr>(tramp) + body.size() + 5);
++            body.push_back(0xE9);
++            const s32 back32 = static_cast<s32>(back);
++            for (int i = 0; i < 4; ++i) {
++                body.push_back(static_cast<u8>(static_cast<u32>(back32) >> (8 * i)));
++            }
++            std::memcpy(tramp, body.data(), body.size());
++            WriteSite(code, r.length, tramp);
++            ++st.trampolines;
++            break;
++        }
++        case Kind::Unsupported:
++            DC_WARN("fs patcher: %s at %#llx (%02x %02x %02x %02x %02x %02x %02x %02x)", r.reason,
++                    a, code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
++            ++st.unsupported;
++            break;
++        }
++        a += r.length;
++    }
++    return st;
++}
++
++} // namespace Core::FsPatch
+diff --git a/src/core/fs_patcher.h b/src/core/fs_patcher.h
+new file mode 100644
+index 0000000..597def3
+--- /dev/null
++++ b/src/core/fs_patcher.h
+@@ -0,0 +1,40 @@
++#pragma once
++
++// Rewrites guest instructions that use the FS segment so they work on hosts
++// where FS cannot be pointed at the guest TCB.
++//
++// The PS4 (FreeBSD) ABI keeps the thread pointer in FS; guest code reads the
++// TCB with `mov reg, fs:[0]`, the stack-protector canary with `fs:[0x28]` and a
++// few other fields at small offsets. On an Intel Mac we get an FS segment from
++// an LDT entry (i386_set_ldt, see tls.cpp). Under Rosetta 2 there is no LDT, and
++// FS itself cannot be set from user space, so instead the guest code is patched
++// once, at load time, to read the same data through GS, which on macOS always
++// addresses the per-thread pthread TSD array (one 8-byte slot per pthread key):
++//
++//   fs:[0]  / fs:[0x28]   ->  same instruction with gs:[slot], in place
++//                             (the TCB pointer and the canary each own a slot)
++//   any other fs:[disp32] ->  jmp to a small trampoline that loads the TCB
++//                             pointer from its slot into a scratch register,
++//                             runs the original instruction on [scratch+disp32]
++//                             and restores the scratch register (no stack use,
++//                             so the red zone and flags are untouched)
++//
++// FS accesses with a base or index register, VEX/EVEX-encoded ones and the
++// like are not rewritten; they are counted and logged.
++
++#include "common/types.h"
++
++namespace Core::FsPatch {
++
++struct Stats {
++    u64 in_place = 0;
++    u64 trampolines = 0;
++    u64 unsupported = 0;
++};
++
++// Patches every FS-relative instruction in [begin, end). The range must be
++// writable and every site needs trampoline room from Signals::AllocTrampoline.
++// Call once per module before any guest thread runs.
++Stats PatchRange(VAddr begin, VAddr end);
++
++} // namespace Core::FsPatch
+diff --git a/src/core/loader/linker.cpp b/src/core/loader/linker.cpp
+index 5394c47..af424af 100644
+--- a/src/core/loader/linker.cpp
++++ b/src/core/loader/linker.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "common/log.h"
+ #include "core/address_space.h"
++#include "core/fs_patcher.h"
+ #include "core/memory.h"
+ #include "core/signals.h"
+ #include "core/tls.h"
+@@ -296,6 +297,19 @@ void Linker::Relocate() {
+     for (auto& m : modules) {
+         RelocateModule(*m);
+     }
++    // Without an FS segment (Rosetta 2), guest code reads its TCB through GS
++    // instead; rewrite the FS accesses while the images are still writable.
++    if (Tls::GetMode() == Tls::Mode::Patched) {
++        FsPatch::Stats total;
++        for (auto& m : modules) {
++            const FsPatch::Stats st = FsPatch::PatchRange(m->CodeBegin(), m->CodeEnd());
++            total.in_place += st.in_place;
++            total.trampolines += st.trampolines;
++            total.unsupported += st.unsupported;
++        }
++        DC_INFO("fs patcher: %llu in place, %llu via trampoline, %llu unsupported", total.in_place,
++                total.trampolines, total.unsupported);
++    }
+     for (auto& m : modules) {
+         m->Protect();
+     }
+diff --git a/src/core/signals.cpp b/src/core/signals.cpp
+index 7bf2ff4..468978a 100644
+--- a/src/core/signals.cpp
++++ b/src/core/signals.cpp
+@@ -215,6 +215,15 @@ void Handler(int sig, siginfo_t* info, void* raw) {
+         Die(sig);
+     }
+ 
++    if (sig == SIGSEGV && reinterpret_cast<u64>(info->si_addr) < 0x10000) {
++        for (int i = 0; i < 3; ++i) {
++            if (code[i] == 0x64) {
++                DC_ERROR("hint: FS-relative access that the FS patcher did not rewrite "
++                         "(see its warnings at load time)");
++                break;
++            }
++        }
++    }
+     Describe(sig == SIGSEGV ? "segmentation fault" : "bus error", rip,
+              reinterpret_cast<u64>(info->si_addr), rsp);
+     Die(sig);
+@@ -237,6 +246,21 @@ void SetFaultHandler(FaultHandler handler) {
+     g_fault_handler.store(handler, std::memory_order_release);
+ }
+ 
++u8* AllocTrampoline(VAddr near_site, u64 size) {
++    std::scoped_lock lk(g_patch_lock);
++    for (PatchArea& a : g_areas) {
++        if (near_site >= a.code_begin && near_site < a.code_end) {
++            if (a.next + size > a.end) {
++                return nullptr;
++            }
++            u8* p = reinterpret_cast<u8*>(a.next);
++            a.next = AlignUp(a.next + size, 16);
++            return p;
++        }
++    }
++    return nullptr;
++}
++
+ void AddPatchArea(VAddr code_begin, VAddr code_end, VAddr area, u64 area_size) {
+     std::scoped_lock lk(g_patch_lock);
+     g_areas.push_back({code_begin, code_end, area, area + area_size});
+diff --git a/src/core/signals.h b/src/core/signals.h
+index e6f8027..c30b2a1 100644
+--- a/src/core/signals.h
++++ b/src/core/signals.h
+@@ -23,6 +23,11 @@ void Install(AddressDescriber describer);
+ // reach). `area` must be mapped RWX and within 2 GB of the code.
+ void AddPatchArea(VAddr code_begin, VAddr code_end, VAddr area, u64 area_size);
+ 
++// Carves `size` bytes of executable trampoline space from the patch area that
++// covers `near_site` (a code address). Returns nullptr when the area is full or
++// none covers the address. Used by the FS patcher at load time.
++u8* AllocTrampoline(VAddr near_site, u64 size);
++
+ // Runs first on SIGSEGV/SIGBUS with the ucontext_t* and the fault address;
+ // returning true resumes the faulting code (the GPU renderer write-watches
+ // guest pages this way).
+diff --git a/src/core/tls.cpp b/src/core/tls.cpp
+index 8544c02..fac3b4c 100644
+--- a/src/core/tls.cpp
++++ b/src/core/tls.cpp
+@@ -10,6 +10,7 @@
+ #include <pthread.h>
+ #include <sys/mman.h>
+ 
++#include "common/host.h"
+ #include "common/log.h"
+ 
+ // Low memory for the LDT segments: a descriptor base is only 32 bits wide.
+@@ -40,6 +41,16 @@ u32 g_max_index = 0;
+ std::vector<u16> g_free_ldt;
+ pthread_key_t g_state_key;
+ 
++Mode g_mode = Mode::Ldt;
++// Patched mode: TSD keys whose per-thread slot the rewritten guest code reads
++// through GS (the GS base is the pthread TSD array, slot n at offset 8 * n).
++pthread_key_t g_tcb_key, g_canary_key, g_scratch_key;
++constexpr pthread_key_t kMaxDirectKey = 512; // keys below this are addressable as gs:[8 * key]
++
++u32 SlotOffset(pthread_key_t key) {
++    return static_cast<u32>(key * sizeof(void*));
++}
++
+ u64 StaticSize() {
+     const ModuleTls& exe = g_modules[1];
+     return exe.memsz ? AlignUp(exe.memsz, std::max<u64>(exe.align, 16)) : 0;
+@@ -48,6 +59,25 @@ u64 StaticSize() {
+ void InitOnce() {
+     static std::once_flag once;
+     std::call_once(once, [] {
++        // Rosetta 2 has no LDT; native Intel keeps the hardware path.
++        g_mode = Host::RunningUnderRosetta() ? Mode::Patched : Mode::Ldt;
++        if (const char* want = std::getenv("DC_TLS")) {
++            if (std::strcmp(want, "patch") == 0) {
++                g_mode = Mode::Patched;
++            } else if (std::strcmp(want, "ldt") == 0) {
++                g_mode = Mode::Ldt;
++            }
++        }
++        DC_INFO("guest TLS: %s", g_mode == Mode::Patched ? "patched fs accesses (GS/TSD slots)"
++                                                         : "LDT segment");
++        if (g_mode == Mode::Patched) {
++            for (pthread_key_t* key : {&g_tcb_key, &g_canary_key, &g_scratch_key}) {
++                if (pthread_key_create(key, nullptr) != 0 || *key >= kMaxDirectKey) {
++                    DC_ERROR("cannot get a directly addressable pthread TSD slot (key %lu)", *key);
++                    std::abort();
++                }
++            }
++        }
+         mmap(reinterpret_cast<void*>(kLdtRegionBase), kLdtRegionSize, PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+         for (u16 i = 0; i < kLdtCount; ++i) {
+@@ -105,6 +135,26 @@ void* AllocModuleBlock(u32 index) {
+ 
+ } // namespace
+ 
++Mode GetMode() {
++    InitOnce();
++    return g_mode;
++}
++
++u32 TcbSlotOffset() {
++    InitOnce();
++    return SlotOffset(g_tcb_key);
++}
++
++u32 CanarySlotOffset() {
++    InitOnce();
++    return SlotOffset(g_canary_key);
++}
++
++u32 ScratchSlotOffset() {
++    InitOnce();
++    return SlotOffset(g_scratch_key);
++}
++
+ void RegisterModule(u32 index, const ModuleTls& tls) {
+     if (index == 0 || index > kMaxModules) {
+         DC_ERROR("TLS index %u out of range", index);
+@@ -140,7 +190,12 @@ Tcb* SetupThread() {
+     tcb->dtv = dtv;
+ 
+     auto* state = new ThreadState{tcb, block, 0};
+-    state->ldt_index = InstallLdt(tcb);
++    if (g_mode == Mode::Ldt) {
++        state->ldt_index = InstallLdt(tcb);
++    } else {
++        pthread_setspecific(g_tcb_key, tcb);
++        pthread_setspecific(g_canary_key, reinterpret_cast<void*>(tcb->canary));
++    }
+     pthread_setspecific(g_state_key, state);
+     return tcb;
+ }
+@@ -155,7 +210,7 @@ void TeardownThread() {
+     }
+     std::free(state->tcb->dtv);
+     std::free(state->block);
+-    {
++    if (g_mode == Mode::Ldt) {
+         std::scoped_lock lk(g_lock);
+         g_free_ldt.push_back(state->ldt_index);
+     }
+diff --git a/src/core/tls.h b/src/core/tls.h
+index 7841b9e..fcf2d55 100644
+--- a/src/core/tls.h
++++ b/src/core/tls.h
+@@ -6,9 +6,15 @@
+ //                                    ^ fs:0 reads Tcb::self
+ //
+ // Other modules' TLS blocks are allocated lazily through the DTV and reached
+-// via __tls_get_addr. Guest code finds the TCB with `mov reg, fs:[0]`; on
+-// macOS we point FS at a small LDT segment holding a copy of the TCB, since
+-// the FS base itself cannot be set from user space.
++// via __tls_get_addr. Guest code finds the TCB with `mov reg, fs:[0]`. The FS
++// base itself cannot be set from user space on macOS, so there are two ways to
++// make those accesses work (see Mode):
++//  - Ldt: FS points at a small LDT segment holding a copy of the TCB. Needs
++//    i386_set_ldt, i.e. a real Intel CPU.
++//  - Patched: nothing is set up in hardware. The guest code is rewritten at load
++//    time (fs_patcher.h) to read the TCB pointer and canary from per-thread
++//    pthread TSD slots through GS instead. Works under Rosetta 2, where there
++//    is no LDT. Chosen automatically when translated; DC_TLS=ldt|patch overrides.
+ 
+ #include "common/types.h"
+ 
+@@ -30,6 +36,17 @@ struct ModuleTls {
+     u64 align;
+ };
+ 
++enum class Mode { Ldt, Patched };
++
++// The mode in use (decided on first call; call it before starting guest threads).
++Mode GetMode();
++
++// Patched mode: byte offsets from the GS base (the pthread TSD array) of the
++// per-thread slots the rewritten guest code reads. Valid once GetMode() ran.
++u32 TcbSlotOffset();     // holds the Tcb pointer (what fs:[0] returned)
++u32 CanarySlotOffset();  // holds Tcb::canary (what fs:[0x28] returned)
++u32 ScratchSlotOffset(); // spill slot for the patcher's trampolines
++
+ // Registers a module's TLS template under its 1-based TLS index. Index 1 (the
+ // executable) becomes the static block in front of each TCB.
+ void RegisterModule(u32 index, const ModuleTls& tls);
+diff --git a/src/gpu/metal/mtl_renderer.mm b/src/gpu/metal/mtl_renderer.mm
+index 3e4f132..f0d1634 100644
+--- a/src/gpu/metal/mtl_renderer.mm
++++ b/src/gpu/metal/mtl_renderer.mm
+@@ -1565,7 +1565,10 @@ struct MetalRenderer::Impl {
+         d.arrayLength = layers;
+       }
+       d.usage = MTLTextureUsageShaderRead;
+-      d.storageMode = MTLStorageModeManaged;
++      // Managed needs explicit CPU<->GPU syncing on discrete GPUs only; on unified
++      // memory (Apple Silicon) Shared is the right mode and costs nothing.
++      d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared
++                                               : MTLStorageModeManaged;
+       d.swizzle =
+           MTLTextureSwizzleChannelsMake(Swizzle(swz), Swizzle(swz >> 3),
+                                         Swizzle(swz >> 6), Swizzle(swz >> 9));
+@@ -3472,7 +3475,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
+                                      width:f.width
+                                     height:f.height
+                                  mipmapped:NO];
+-    d.storageMode = MTLStorageModeManaged;
++    // Managed only matters on discrete GPUs; unified memory wants Shared.
++    d.storageMode = device.hasUnifiedMemory ? MTLStorageModeShared
++                                            : MTLStorageModeManaged;
+     d.usage = MTLTextureUsageShaderRead;
+     src = [device newTextureWithDescriptor:d];
+     [src replaceRegion:MTLRegionMake2D(0, 0, f.width, f.height)
+diff --git a/src/hle/kernel/time.cpp b/src/hle/kernel/time.cpp
+index 429a515..6a5e090 100644
+--- a/src/hle/kernel/time.cpp
++++ b/src/hle/kernel/time.cpp
+@@ -9,6 +9,7 @@
+ #include <unistd.h>
+ #include <x86intrin.h>
+ 
++#include "common/host.h"
+ #include "hle/hle.h"
+ #include "hle/kernel/kernel.h"
+ 
+@@ -18,18 +19,43 @@ namespace {
+ 
+ const u64 g_start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+ 
++// Measures how fast RDTSC counts against the monotonic clock. Under Rosetta 2
++// the instruction is emulated and its rate need not match any sysctl value (there
++// is no machdep.tsc.frequency on Apple Silicon), but guest code that reads the TSC
++// itself and divides by the frequency we report must see consistent numbers.
++u64 CalibrateTsc() {
++    const u64 t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    const u64 c0 = __rdtsc();
++    u64 t1;
++    do {
++        t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    } while (t1 - t0 < 20'000'000);
++    const u64 c1 = __rdtsc();
++    const u64 hz = static_cast<u64>(static_cast<unsigned __int128>(c1 - c0) * 1'000'000'000ull /
++                                    (t1 - t0));
++    return (hz + 500'000) / 1'000'000 * 1'000'000; // the true rate is a round MHz figure
++}
++
+ u64 TscFrequency() {
+     static const u64 freq = [] {
+         u64 f = 0;
+-        size_t size = sizeof(f);
+-        if (sysctlbyname("machdep.tsc.frequency", &f, &size, nullptr, 0) != 0 || f == 0) {
+-            f = 1000000000; // fall back to 1 GHz rather than divide by zero
++        if (!Host::RunningUnderRosetta()) {
++            size_t size = sizeof(f);
++            if (sysctlbyname("machdep.tsc.frequency", &f, &size, nullptr, 0) != 0) {
++                f = 0;
++            }
+         }
+-        return f;
++        if (f == 0) {
++            f = CalibrateTsc();
++        }
++        return f ? f : 1000000000; // never divide by zero
+     }();
+     return freq;
+ }
+ 
++// Calibrate at startup rather than stalling the first guest thread that asks.
++[[maybe_unused]] const u64 g_tsc_frequency = TscFrequency();
++
+ // FreeBSD clock ids -> host clocks.
+ bool HostClock(int guest, clockid_t* out) {
+     switch (guest) {
+diff --git a/tests/README.md b/tests/README.md
+new file mode 100644
+index 0000000..20bb478
+--- /dev/null
++++ b/tests/README.md
+@@ -0,0 +1,13 @@
++# FS patcher test (Linux x86-64 only)
++
++`fs_patcher_test_linux.cpp` runs small `fs:`-using snippets natively with a real FS base, then
++the same snippets after `Core::FsPatch::PatchRange` with FS = 0 and GS pointing at a fake TSD
++block, and compares registers (including the r10/r11 scratch candidates), flags, memory, the red
++zone and RSP. It needs GNU `as`, Zydis (v4.1.1) and a Linux x86-64 host; it does not run on macOS.
++
++```bash
++cd tests && python3 fs_patcher_gen.py          # assembles the cases into fs_patcher_cases.inc
++g++ -std=c++23 -O1 -masm=intel -w -I../src -I<zydis>/include -I<zydis>/dependencies/zycore/include \
++    -I<zydis>/build -I<zydis>/build/zycore fs_patcher_test_linux.cpp ../src/core/fs_patcher.cpp \
++    <zydis>/build/libZydis.a <zydis>/build/zycore/libZycore.a -o fs_patcher_test && ./fs_patcher_test
++```
+diff --git a/tests/fs_patcher_cases.py b/tests/fs_patcher_cases.py
+new file mode 100644
+index 0000000..b42e617
+--- /dev/null
++++ b/tests/fs_patcher_cases.py
+@@ -0,0 +1,28 @@
++# name, asm (intel syntax), setup regs (rdi), expect_kind
++CASES = [
++ ("self",        "mov rax, fs:[0]\nret", "inplace"),
++ ("canary64",    "mov rax, fs:[0x28]\nret", "inplace"),
++ ("canary32",    "mov eax, fs:[0x28]\nret", "inplace"),
++ ("canary_xor",  "mov rax, 0x1234\nxor rax, fs:[0x28]\nret", "inplace"),
++ ("canary_sub_flags", "mov rax, fs:[0x28]\nsub rax, fs:[0x28]\nsetz al\nmovzx eax, al\nret", "inplace"),
++ ("thread",      "mov rax, fs:[0x10]\nret", "tramp"),
++ ("r10_dest",    "mov r10, fs:[0x10]\nmov rax, r10\nret", "tramp"),
++ ("negdisp",     "mov rax, fs:[-0x20]\nret", "tramp"),
++ ("add_mem",     "mov eax, 5\nadd rax, fs:[0x18]\nret", "tramp"),
++ ("cmp_imm_flags","cmp qword ptr fs:[0x30], 0x12\nsete al\nmovzx eax, al\nret", "tramp"),
++ ("cmp_imm32",   "cmp dword ptr fs:[0x30], 0x12345\nsetb al\nmovzx eax, al\nret", "tramp"),
++ ("store",       "mov qword ptr fs:[0x30], rdi\nmov rax, fs:[0x30]\nret", "tramp"),
++ ("opsize16",    "xor eax, eax\nmov ax, fs:[0x10]\nret", "tramp"),
++ ("lock_add",    "lock add qword ptr fs:[0x38], 1\nmov rax, fs:[0x38]\nret", "tramp"),
++ ("rex_r",       "mov r8d, fs:[0x10]\nmov eax, r8d\nret", "tramp"),
++ ("r11_src_store","mov r10, 0x77\nmov qword ptr fs:[0x40], r10\nmov rax, fs:[0x40]\nret", "tramp"),
++ ("byte_al",     "xor eax, eax\nmov al, fs:[0x10]\nret", "tramp"),
++ ("byte_dil",    "xor eax, eax\nmov dil, fs:[0x10]\nmov eax, edi\nret", "tramp"),
++ ("movdqu128",   "movdqu xmm0, fs:[0x28]\nmovq rax, xmm0\nret", "tramp"),
++ ("redzone",     "mov qword ptr [rsp-8], 0x1234\nmov rax, fs:[0x10]\nadd rax, [rsp-8]\nret", "tramp"),
++ ("rsp_alive",   "mov rax, rsp\nmov rcx, fs:[0x10]\nsub rax, rsp\nret", "tramp"),
++ ("high_byte",   "mov ah, fs:[0x10]\nret", "unsupported"),
++ ("base_reg",    "mov rax, fs:[rax]\nret", "unsupported"),
++ ("lea_ignored", "lea rax, fs:[0x10]\nret", "none"),
++ ("cmpxchg",     "mov rax, 0\nmov rcx, 9\nlock cmpxchg qword ptr fs:[0x30], rcx\nsete al\nmovzx eax, al\nret", "tramp"),
++]
+diff --git a/tests/fs_patcher_gen.py b/tests/fs_patcher_gen.py
+new file mode 100644
+index 0000000..5f6e372
+--- /dev/null
++++ b/tests/fs_patcher_gen.py
+@@ -0,0 +1,15 @@
++import subprocess, os, sys
++from fs_patcher_cases import CASES
++out=[]
++for name, asm, kind in CASES:
++    open("t.s","w").write(".intel_syntax noprefix\n.text\n"+asm+"\n")
++    subprocess.check_call(["as","--64","t.s","-o","t.o"])
++    subprocess.check_call(["objcopy","-O","binary","-j",".text","t.o","t.bin"])
++    b=open("t.bin","rb").read()
++    out.append((name,kind,b))
++with open("fs_patcher_cases.inc","w") as f:
++    f.write("struct Case { const char* name; const char* kind; std::vector<unsigned char> code; };\n")
++    f.write("static std::vector<Case> kCases = {\n")
++    for name,kind,b in out:
++        f.write('  {"%s","%s",{%s}},\n'%(name,kind,",".join(str(x) for x in b)))
++    f.write("};\n")
+diff --git a/tests/fs_patcher_test_linux.cpp b/tests/fs_patcher_test_linux.cpp
+new file mode 100644
+index 0000000..3f36f1f
+--- /dev/null
++++ b/tests/fs_patcher_test_linux.cpp
+@@ -0,0 +1,138 @@
++// Linux x86-64 test: runs guest-style FS code natively with a real FS base, then the
++// patched version with FS=0 and GS pointing at a fake TSD block, and compares.
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++#include <sys/mman.h>
++#include "core/fs_patcher.h"
++#include "core/signals.h"
++#include "core/tls.h"
++#include "fs_patcher_cases.inc"
++
++static u8* g_tramp_next; static u8* g_tramp_end;
++namespace Core::Tls {
++u32 TcbSlotOffset() { return 0x100; }
++u32 CanarySlotOffset() { return 0x108; }
++u32 ScratchSlotOffset() { return 0x110; }
++}
++namespace Core::Signals {
++u8* AllocTrampoline(VAddr, u64 size) {
++    if (g_tramp_next + size > g_tramp_end) return nullptr;
++    u8* p = g_tramp_next; g_tramp_next = (u8*)AlignUp((u64)g_tramp_next + size, 16); return p;
++}
++}
++
++extern "C" void run_with_bases(const void* code, u64 fsbase, u64 gsbase, u64* regs, u64 rdi_arg);
++asm(R"(
++.globl run_with_bases
++run_with_bases:
++  push rbx
++  push r12
++  push r13
++  push r14
++  push r15
++  sub rsp, 32
++  mov r12, rdi
++  mov r13, rsi
++  mov r14, rdx
++  mov r15, rcx
++  mov rbx, r8
++  mov eax, 158
++  mov edi, 0x1003
++  lea rsi, [rsp]
++  syscall
++  mov eax, 158
++  mov edi, 0x1004
++  lea rsi, [rsp+8]
++  syscall
++  mov eax, 158
++  mov edi, 0x1002
++  mov rsi, r13
++  syscall
++  mov eax, 158
++  mov edi, 0x1001
++  mov rsi, r14
++  syscall
++  mov rdi, rbx
++  mov r10, 0x1010101010101010
++  mov r11, 0x1111111111111111
++  mov r8,  0x0808080808080808
++  mov rcx, 0x0c0c0c0c0c0c0c0c
++  mov rdx, 0x0d0d0d0d0d0d0d0d
++  call r12
++  mov [r15+0], rax
++  mov [r15+8], rcx
++  mov [r15+16], rdx
++  mov [r15+24], rdi
++  mov [r15+32], r8
++  mov [r15+40], r10
++  mov [r15+48], r11
++  mov rbx, rax
++  mov eax, 158
++  mov edi, 0x1002
++  mov rsi, [rsp]
++  syscall
++  mov eax, 158
++  mov edi, 0x1001
++  mov rsi, [rsp+8]
++  syscall
++  mov rax, rbx
++  add rsp, 32
++  pop r15
++  pop r14
++  pop r13
++  pop r12
++  pop rbx
++  ret
++)");
++
++int main() {
++    // asm above is AT&T-default in gcc top-level asm; we compile with -masm=intel
++    u8* region = (u8*)mmap(nullptr, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
++    g_tramp_next = region + 0x80000; g_tramp_end = region + 0xF0000;
++    int fails = 0;
++    for (auto& c : kCases) {
++        const std::string kind = c.kind;
++        u8* c1 = region + 0x10000; u8* c2 = region + 0x20000;
++        std::memset(c1, 0xCC, 0x1000); std::memset(c2, 0xCC, 0x1000);
++        std::memcpy(c1, c.code.data(), c.code.size());
++        std::memcpy(c2, c.code.data(), c.code.size());
++        auto st = Core::FsPatch::PatchRange((VAddr)c2, (VAddr)c2 + c.code.size());
++
++        bool ok = true;
++        if (kind == "inplace") ok = st.in_place >= 1 && st.trampolines == 0 && st.unsupported == 0 && std::memcmp(c2, c.code.data(), c.code.size()) != 0 && std::memcmp(c2 + 0, c.code.data(), 0) == 0;
++        if (kind == "tramp") ok = st.trampolines >= 1 && st.in_place == 0 && st.unsupported == 0;
++        if (kind == "unsupported") ok = st.unsupported == 1 && st.in_place == 0 && st.trampolines == 0;
++        if (kind == "none") ok = st.unsupported == 0 && st.in_place == 0 && st.trampolines == 0 && !std::memcmp(c1, c2, c.code.size());
++        if (!ok) { std::printf("FAIL %-18s planner stats in=%llu tr=%llu un=%llu\n", c.name, st.in_place, st.trampolines, st.unsupported); ++fails; continue; }
++        if (kind == "unsupported") { std::printf("ok   %-18s (left unpatched, as expected)\n", c.name); continue; }
++
++        u8* mem = (u8*)aligned_alloc(4096, 16384);
++        u8* tcb = mem + 8192;
++        for (int i = 0; i < 16384; ++i) mem[i] = (u8)(i * 7 + 3);
++        *(u64*)tcb = (u64)tcb;
++        *(u64*)(tcb + 0x30) = 0;      // so cmp/cmpxchg cases are meaningful
++        *(u64*)(tcb + 0x38) = 41;
++        std::vector<u8> snap(mem, mem + 16384);
++
++        u8* G = (u8*)aligned_alloc(4096, 8192); std::memset(G, 0xAB, 8192);
++        *(u64*)(G + 0x100) = (u64)tcb; *(u64*)(G + 0x108) = *(u64*)(tcb + 0x28); *(u64*)(G + 0x110) = 0xDEAD;
++
++        u64 r1[8]{}, r2[8]{};
++        run_with_bases(c1, (u64)tcb, 0, r1, 0x99);
++        std::vector<u8> after1(mem, mem + 16384);
++        std::memcpy(mem, snap.data(), 16384);
++        run_with_bases(c2, 0, (u64)G, r2, 0x99);
++        std::vector<u8> after2(mem, mem + 16384);
++
++        bool same = !std::memcmp(r1, r2, sizeof r1) && after1 == after2;
++        if (kind == "none") same = same; // identical code, trivially
++        std::printf("%s %-18s rax=%#llx/%#llx  %s\n", same ? "ok  " : "FAIL", c.name, r1[0], r2[0],
++                    same ? "" : "<-- mismatch");
++        if (!same) { ++fails; for (int i=0;i<7;++i) std::printf("   reg%d %#llx vs %#llx\n", i, r1[i], r2[i]); }
++        free(mem); free(G);
++    }
++    std::printf("%s (%d failures)\n", fails ? "FAILED" : "ALL PASSED", fails);
++    return fails != 0;
++}
+-- 
+2.43.0
+

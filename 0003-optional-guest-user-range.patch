@@ -1,0 +1,161 @@
+From 9c030bc8a7da61d84a5cd010c0891be523c1c6d0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 17:48:32 +0000
+Subject: [PATCH] Make the guest user range optional (off on Apple Silicon)
+
+Rosetta 2 reserves [0xFC0000000, 0x7000000000) with no access in every translated
+process, so the 64 GB+ GUEST_USER segment makes exec fail (SIGKILL before main).
+DC_GUEST_USER_RANGE=OFF drops the segment and the range; hints above the system
+areas are served from the default search base.
+---
+ CMakeLists.txt             | 25 ++++++++++++++++++++-----
+ README.md                  | 11 +++++++----
+ src/core/address_space.cpp |  4 ++++
+ src/core/address_space.h   | 14 +++++++++++---
+ src/core/memory.cpp        |  7 +++++++
+ 5 files changed, 49 insertions(+), 12 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5be4a74..3d63b07 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -153,11 +153,24 @@ target_compile_options(driveclub PRIVATE
+     $<$<CONFIG:Release>:-O3 -march=${DC_HOST_MARCH}>
+ )
+ 
+-# End of the guest "user" range, which also sizes the GUEST_USER zero-fill segment
+-# mapped at exec time. The default (96 TB) is what Intel Macs run with; lower it
+-# (e.g. 0x10000000000 = 1 TB) if the process is killed before printing anything.
++# The guest "user" range (64 GB up) is mapped by the kernel at exec time as the huge
++# GUEST_USER zero-fill segment. Rosetta 2 reserves [0xFC0000000, 0x7000000000) in every
++# translated process, so there the segment makes exec fail (the process is killed before
++# main): the range is off by default on Apple Silicon. Guests then only get the system
++# managed and system reserved areas (0 to 63 GB), which is where default allocations go.
++if (DC_APPLE_SILICON)
++    set(DC_GUEST_USER_RANGE_DEFAULT OFF)
++else()
++    set(DC_GUEST_USER_RANGE_DEFAULT ON)
++endif()
++option(DC_GUEST_USER_RANGE "Reserve the guest user range (64 GB and up)" ${DC_GUEST_USER_RANGE_DEFAULT})
++# End of that range (96 TB by default, as on Intel Macs).
+ set(DC_GUEST_USER_MAX 0x600000000000 CACHE STRING "End of the guest user address range")
+-target_compile_definitions(driveclub PRIVATE DC_GUEST_USER_MAX=${DC_GUEST_USER_MAX})
++if (DC_GUEST_USER_RANGE)
++    target_compile_definitions(driveclub PRIVATE DC_GUEST_USER_MAX=${DC_GUEST_USER_MAX})
++else()
++    target_compile_definitions(driveclub PRIVATE DC_NO_GUEST_USER=1)
++endif()
+ 
+ # Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
+ # sit inside the default 4 GB __PAGEZERO. Shrink it, move our own image above
+@@ -168,8 +181,10 @@ target_link_options(driveclub PRIVATE
+     -Wl,-segaddr,GUEST_TCB,0x4000
+     -Wl,-segaddr,GUEST_SYSMGD,0x400000
+     -Wl,-segaddr,GUEST_SYSRSV,0x7FFFFC000
+-    -Wl,-segaddr,GUEST_USER,0x1000000000
+ )
++if (DC_GUEST_USER_RANGE)
++    target_link_options(driveclub PRIVATE -Wl,-segaddr,GUEST_USER,0x1000000000)
++endif()
+ 
+ # Vulkan renderer (shadPS4's, third_party/shadps4): the Windows/Linux backend,
+ # selectable on macOS too through MoltenVK with DC_RENDERER=vulkan.
+diff --git a/README.md b/README.md
+index f4dc44e..fa7a512 100644
+--- a/README.md
++++ b/README.md
+@@ -86,10 +86,13 @@ What differs from an Intel Mac:
+   from `machdep.tsc.frequency`.
+ - **GPU memory.** Unified memory is used as such: textures are `Shared`, not `Managed`.
+ 
+-If the process is killed with no output at all, it died while the kernel was mapping the
+-executable's fixed zero-fill segments (the 96 TB `GUEST_USER` one is the likely culprit under
+-Rosetta). Rebuild with a smaller one, e.g. `-DDC_GUEST_USER_MAX=0x10000000000` (1 TB), and see
+-`otool -l build/driveclub | grep -A9 GUEST` for what the binary requests.
++Rosetta 2 reserves the 64-448 GB address range (`[0xFC0000000, 0x7000000000)`, no access) in
++every translated process, so the guest "user" range that starts at 64 GB cannot be mapped there:
++an executable that asks for it is killed by the kernel at exec, before `main`. On Apple Silicon
++`DC_GUEST_USER_RANGE` therefore defaults to OFF and the guest gets the 0-63 GB system areas only,
++where default allocations are placed (from 8 GB). If the game requests fixed addresses at 64 GB
++or above, the loader reports `guest map ... is outside the reserved ranges` with the address.
++Check what the binary asks for with `otool -l build/driveclub | grep -A3 "segname GUEST"`.
+ 
+ ### Vulkan renderer
+ 
+diff --git a/src/core/address_space.cpp b/src/core/address_space.cpp
+index c9a4a0c..f351349 100644
+--- a/src/core/address_space.cpp
++++ b/src/core/address_space.cpp
+@@ -8,9 +8,11 @@
+ // Sizes are kMax - kMin of the matching range.
+ asm(".zerofill GUEST_SYSMGD,GUEST_SYSMGD,__guest_sysmgd,0x7FFBFC000");
+ asm(".zerofill GUEST_SYSRSV,GUEST_SYSRSV,__guest_sysrsv,0x7C0004000");
++#ifndef DC_NO_GUEST_USER
+ #define DC_STR_(x) #x
+ #define DC_STR(x) DC_STR_(x)
+ asm(".zerofill GUEST_USER,GUEST_USER,__guest_user," DC_STR(DC_GUEST_USER_MAX) "-0x1000000000");
++#endif
+ 
+ namespace Core::AddressSpace {
+ 
+@@ -23,7 +25,9 @@ struct Range {
+ constexpr Range kRanges[] = {
+     {kSystemManagedMin, kSystemManagedMax},
+     {kSystemReservedMin, kSystemReservedMax},
++#ifndef DC_NO_GUEST_USER
+     {kUserMin, kUserMax},
++#endif
+ };
+ 
+ int ToHost(Prot prot) {
+diff --git a/src/core/address_space.h b/src/core/address_space.h
+index 5f23460..bd810d7 100644
+--- a/src/core/address_space.h
++++ b/src/core/address_space.h
+@@ -19,14 +19,22 @@ constexpr VAddr kSystemManagedMax = 0x7FFFFC000;
+ constexpr VAddr kSystemReservedMin = 0x7FFFFC000;
+ constexpr VAddr kSystemReservedMax = 0xFC0000000;
+ // Direct and flexible memory mappings; games use fixed addresses from 64 GB up.
+-// The upper bound sets the size of the GUEST_USER zero-fill segment the kernel maps
+-// at exec time (about 105 TB by default); configurable with -DDC_GUEST_USER_MAX=...
+-// in case a host (Rosetta 2) refuses a segment that large.
++// Under Rosetta 2 this range cannot exist: every translated process has the
++// no-access reservation [0xFC0000000, 0x7000000000) (64-448 GB), which overlaps the
++// start of it, so a build with -DDC_GUEST_USER_RANGE=OFF (the Apple Silicon default,
++// see CMakeLists.txt) leaves it empty. Guest requests for fixed addresses up there
++// then fail with a "outside the reserved ranges" error instead of being served.
++// The upper bound otherwise sizes the GUEST_USER zero-fill segment the kernel maps
++// at exec time (about 105 TB by default, -DDC_GUEST_USER_MAX=... to change).
+ #ifndef DC_GUEST_USER_MAX
+ #define DC_GUEST_USER_MAX 0x600000000000
+ #endif
+ constexpr VAddr kUserMin = 0x1000000000;
++#ifdef DC_NO_GUEST_USER
++constexpr VAddr kUserMax = kUserMin; // empty
++#else
+ constexpr VAddr kUserMax = DC_GUEST_USER_MAX;
++#endif
+ 
+ enum class Prot : int { None = 0, Read = 1, Write = 2, Exec = 4, ReadWrite = 3 };
+ 
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 8c04e29..229cce8 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -62,6 +62,13 @@ bool Overlaps(VAddr start, u64 size) {
+ // First free, aligned gap of `size` bytes at or above `hint` (or the default
+ // base without a hint).
+ VAddr FindFree(VAddr hint, u64 size, u64 align) {
++#ifdef DC_NO_GUEST_USER
++    // No user range (Rosetta 2): a hint up there is only advisory, so serve it from the
++    // default base instead of failing.
++    if (hint >= AddressSpace::kSystemReservedMax) {
++        hint = 0;
++    }
++#endif
+     VAddr addr = AlignUp(hint ? hint : kDefaultSearchBase, std::max(align, kPage));
+     for (;;) {
+         if (!AddressSpace::Contains(addr, size)) {
+-- 
+2.43.0
+

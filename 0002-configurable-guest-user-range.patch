@@ -1,0 +1,84 @@
+From 46b4b69b6354f447cbe9957e172ef35c3c555440 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 17:02:29 +0000
+Subject: [PATCH] Make the GUEST_USER reservation size configurable
+ (DC_GUEST_USER_MAX)
+
+---
+ CMakeLists.txt             | 6 ++++++
+ README.md                  | 5 +++++
+ src/core/address_space.cpp | 4 +++-
+ src/core/address_space.h   | 8 +++++++-
+ 4 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9845bf6..5be4a74 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -153,6 +153,12 @@ target_compile_options(driveclub PRIVATE
+     $<$<CONFIG:Release>:-O3 -march=${DC_HOST_MARCH}>
+ )
+ 
++# End of the guest "user" range, which also sizes the GUEST_USER zero-fill segment
++# mapped at exec time. The default (96 TB) is what Intel Macs run with; lower it
++# (e.g. 0x10000000000 = 1 TB) if the process is killed before printing anything.
++set(DC_GUEST_USER_MAX 0x600000000000 CACHE STRING "End of the guest user address range")
++target_compile_definitions(driveclub PRIVATE DC_GUEST_USER_MAX=${DC_GUEST_USER_MAX})
++
+ # Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
+ # sit inside the default 4 GB __PAGEZERO. Shrink it, move our own image above
+ # every guest range, and pin the zero-fill reservations from address_space.cpp
+diff --git a/README.md b/README.md
+index cbf4432..f4dc44e 100644
+--- a/README.md
++++ b/README.md
+@@ -86,6 +86,11 @@ What differs from an Intel Mac:
+   from `machdep.tsc.frequency`.
+ - **GPU memory.** Unified memory is used as such: textures are `Shared`, not `Managed`.
+ 
++If the process is killed with no output at all, it died while the kernel was mapping the
++executable's fixed zero-fill segments (the 96 TB `GUEST_USER` one is the likely culprit under
++Rosetta). Rebuild with a smaller one, e.g. `-DDC_GUEST_USER_MAX=0x10000000000` (1 TB), and see
++`otool -l build/driveclub | grep -A9 GUEST` for what the binary requests.
++
+ ### Vulkan renderer
+ 
+ `src/gpu/vulkan` puts shadPS4's Vulkan renderer (`video_core` + `shader_recompiler`,
+diff --git a/src/core/address_space.cpp b/src/core/address_space.cpp
+index ae70c71..c9a4a0c 100644
+--- a/src/core/address_space.cpp
++++ b/src/core/address_space.cpp
+@@ -8,7 +8,9 @@
+ // Sizes are kMax - kMin of the matching range.
+ asm(".zerofill GUEST_SYSMGD,GUEST_SYSMGD,__guest_sysmgd,0x7FFBFC000");
+ asm(".zerofill GUEST_SYSRSV,GUEST_SYSRSV,__guest_sysrsv,0x7C0004000");
+-asm(".zerofill GUEST_USER,GUEST_USER,__guest_user,0x5FF000000000");
++#define DC_STR_(x) #x
++#define DC_STR(x) DC_STR_(x)
++asm(".zerofill GUEST_USER,GUEST_USER,__guest_user," DC_STR(DC_GUEST_USER_MAX) "-0x1000000000");
+ 
+ namespace Core::AddressSpace {
+ 
+diff --git a/src/core/address_space.h b/src/core/address_space.h
+index c879ed2..5f23460 100644
+--- a/src/core/address_space.h
++++ b/src/core/address_space.h
+@@ -19,8 +19,14 @@ constexpr VAddr kSystemManagedMax = 0x7FFFFC000;
+ constexpr VAddr kSystemReservedMin = 0x7FFFFC000;
+ constexpr VAddr kSystemReservedMax = 0xFC0000000;
+ // Direct and flexible memory mappings; games use fixed addresses from 64 GB up.
++// The upper bound sets the size of the GUEST_USER zero-fill segment the kernel maps
++// at exec time (about 105 TB by default); configurable with -DDC_GUEST_USER_MAX=...
++// in case a host (Rosetta 2) refuses a segment that large.
++#ifndef DC_GUEST_USER_MAX
++#define DC_GUEST_USER_MAX 0x600000000000
++#endif
+ constexpr VAddr kUserMin = 0x1000000000;
+-constexpr VAddr kUserMax = 0x600000000000;
++constexpr VAddr kUserMax = DC_GUEST_USER_MAX;
+ 
+ enum class Prot : int { None = 0, Read = 1, Write = 2, Exec = 4, ReadWrite = 3 };
+ 
+-- 
+2.43.0
+
