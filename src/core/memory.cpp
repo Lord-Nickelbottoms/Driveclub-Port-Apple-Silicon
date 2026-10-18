@@ -1,7 +1,7 @@
 #include "core/memory.h"
 
-#include <cerrno>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <iterator>
 #include <map>
@@ -118,6 +118,13 @@ void Carve(VAddr start, u64 size) {
 
 // Picks the final address for a new mapping; returns errno or 0.
 int Place(VAddr* addr, u64 size, int flags, u64 align) {
+#ifdef DC_NO_GUEST_USER
+    // Rosetta reserves the guest user range. Treat fixed addresses there as
+    // hints so callers using the returned address can still allocate memory.
+    if ((flags & kMapFixed) && *addr >= AddressSpace::kSystemReservedMax) {
+        flags &= ~kMapFixed;
+    }
+#endif
     if (flags & kMapFixed) {
         if (*addr % kPage != 0 || !AddressSpace::Contains(*addr, size)) {
             return EINVAL;
@@ -320,9 +327,7 @@ void* DirectHostView() {
     return view;
 }
 
-u64 DirectMapGeneration() {
-    return g_generation.load(std::memory_order_acquire);
-}
+u64 DirectMapGeneration() { return g_generation.load(std::memory_order_acquire); }
 
 std::vector<DirectRange> DirectMappings() {
     std::scoped_lock lk(g_lock);

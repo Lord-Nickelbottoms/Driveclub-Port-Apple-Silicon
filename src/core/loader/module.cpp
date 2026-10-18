@@ -14,9 +14,7 @@ namespace {
 
 constexpr u64 kPageSize = 0x4000; // PS4 page size; also a multiple of host 4K pages
 
-bool IsLoadable(const Elf64_Phdr& ph) {
-    return ph.p_type == PT_LOAD || ph.p_type == PT_SCE_RELRO;
-}
+bool IsLoadable(const Elf64_Phdr& ph) { return ph.p_type == PT_LOAD || ph.p_type == PT_SCE_RELRO; }
 
 // Reads one DWARF-encoded pointer from .eh_frame_hdr (the encodings linkers
 // actually emit there). Returns false for anything else.
@@ -139,8 +137,9 @@ bool Module::MapSegments(const ElfImage& image, std::string& error) {
             eh_frame_hdr_size = ph.p_memsz;
             break;
         case PT_SCE_PROCPARAM:
-        case PT_SCE_MODULE_PARAM:
             proc_param = ph.p_vaddr;
+            break;
+        case PT_SCE_MODULE_PARAM:
             break;
         default:
             break;

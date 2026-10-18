@@ -26,6 +26,41 @@ endif()
 # PS4 code runs natively, so the host must be x86_64 (Intel Mac).
 set(CMAKE_OSX_ARCHITECTURES x86_64)
 
+execute_process(COMMAND sysctl -n hw.optional.arm64
+                OUTPUT_VARIABLE DC_HW_ARM64 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if (DC_HW_ARM64 STREQUAL "1")
+    set(DC_APPLE_SILICON TRUE)
+    message(STATUS "Apple Silicon host: building x86_64 for Rosetta 2")
+    # Libraries must be x86_64 too, so use the Intel Homebrew in /usr/local (install it and
+    # the dependencies through `arch -x86_64`, see README, "Apple Silicon").
+    if (EXISTS /usr/local/Homebrew)
+        list(PREPEND CMAKE_PREFIX_PATH /usr/local)
+        # Keep find_package from picking up the arm64 libraries in /opt/homebrew.
+        list(APPEND CMAKE_IGNORE_PREFIX_PATH /opt/homebrew)
+    else()
+        message(WARNING "No Intel Homebrew in /usr/local: SDL3 from /opt/homebrew is arm64 and "
+                        "will not link into this x86_64 build (see README, Apple Silicon)")
+    endif()
+endif()
+
+# Detect ARM64 host
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(DC_ARM64_HOST ON)
+else()
+    set(DC_ARM64_HOST OFF)
+endif()
+
+# Instruction-set baseline for our own code. -march=native is wrong here: on Apple
+# Silicon it names an arm64 CPU, and Rosetta 2 only guarantees SSE4.2 (plus AVX/AVX2
+# on macOS 15 and later), so the default there is x86-64-v2.
+# if (DC_APPLE_SILICON)
+#    set(DC_HOST_MARCH_DEFAULT x86-64-v2)
+# else()
+#    set(DC_HOST_MARCH_DEFAULT native)
+# endif()
+# set(DC_HOST_MARCH ${DC_HOST_MARCH_DEFAULT} CACHE STRING
+    # "-march= value for Release builds (x86-64-v2, x86-64-v3, native, ...)")
+
 find_package(SDL3 REQUIRED CONFIG)
 
 # Platform core, HLE and the GPU front end (PM4, tiling, GCN decode).
@@ -45,6 +80,8 @@ set(DC_CORE_SOURCES
     src/core/loader/self.h
     src/core/memory.cpp
     src/core/memory.h
+    src/core/rosetta_compat.cpp
+    src/core/rosetta_compat.h
     src/core/runtime.cpp
     src/core/runtime.h
     src/core/signals.cpp
@@ -106,22 +143,15 @@ set(DC_CORE_SOURCES
     src/hle/nid_db.inc
 )
 
-# Metal renderer (macOS): GCN -> MSL translation and the Metal backend.
-set(DC_METAL_SOURCES
-    src/gpu/shader/msl.h
-    src/gpu/shader/msl.cpp
-    src/gpu/shader/msl_prelude.h
-    src/gpu/metal/mtl_device.h
-    src/gpu/metal/mtl_device.mm
-    src/gpu/metal/mtl_presenter.h
-    src/gpu/metal/mtl_presenter.mm
-    src/gpu/metal/mtl_formats.h
-    src/gpu/metal/mtl_renderer.h
-    src/gpu/metal/mtl_compiler.mm
-    src/gpu/metal/mtl_renderer.mm
-)
-
-add_executable(driveclub ${DC_CORE_SOURCES} ${DC_METAL_SOURCES})
+if (DC_ARM64_HOST)
+    target_sources(driveclub PRIVATE
+        src/cpu/jit/arm64_backend.cpp
+        src/cpu/jit/arm64_backend.h
+        src/core/aot_loader.cpp
+        src/core/aot_loader.h
+    )
+    target_compile_definitions(driveclub PRIVATE DC_ARM64_JIT=1)
+endif()
 
 target_include_directories(driveclub PRIVATE src)
 
