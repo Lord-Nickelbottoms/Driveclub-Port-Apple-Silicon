@@ -1,11 +1,9 @@
-# Driveclub Native
+# Driveclub Native Apple Silicon Port
 
-[![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
+A native port of **Driveclub** (PS4, CUSA00003) to **MacOS M-Series**
 
-![LOGO](media/logo.png)
-![Driveclub In-Game](media/2026-10-14_22-34-39.png)
-
-A native port of **Driveclub** (PS4, CUSA00003) to **macOS** and **Windows**.
+#Fork of BlackLineInteractive's Port
+![Link to original Repo](https://github.com/BlackLineInteractive/Driveclub-Port)
 
 | Platform | Game version | Renderer | Where | Maintainer |
 | --- | --- | --- | --- | --- |
@@ -61,7 +59,7 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the 
 
 **macOS**
 
-- Intel Mac (x86_64), Metal 3-capable GPU (tested: AMD Radeon Pro 5500M)
+- M-Series Mac (Testing on MacBook Pro M2 8GB)
 - Xcode, CMake >= 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
 - Your own copy of the game as a decrypted dump (fSELF/fPKG)
 
@@ -110,6 +108,5 @@ This project is licensed under the **GNU General Public License v2.0 or later (G
 
 ## Acknowledgments
 
-- [shadPS4](https://github.com/shadps4-emu/shadPS4) - PS4 emulator, the primary source of knowledge on ELF loading, HLE libraries, PM4, and GCN shader recompilation. Its Vulkan renderer is the reference for GCN/PM4 semantics in the Metal backend, and the renderer of the Windows backend.
-- [OpenGNM](https://ps4-opengnm.github.io/opengnm/) - documentation on PS4 Gnm and GCN shaders.
+- BlackLineInteractive: for providing the code for Intel CPUs
 - Windows backend: deadinside28 and Supermedo (native PS4 runtime), FireBurn (FSR-Vulkan, FSR 4 assets), akitaonrails and the patch authors; see [`windows/README.md`](windows/README.md).
