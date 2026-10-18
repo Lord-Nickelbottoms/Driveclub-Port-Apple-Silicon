@@ -1,5 +1,6 @@
 #include "core/loader/module.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include <sys/mman.h>
@@ -272,6 +273,15 @@ void Module::Protect() {
         prot |= (ph.p_flags & PF_X) ? PROT_EXEC | PROT_READ : 0;
         const u64 start = AlignDown(base + ph.p_vaddr, kPageSize);
         const u64 end = AlignUp(base + ph.p_vaddr + ph.p_memsz, kPageSize);
+        if (std::getenv("DC_LOG_SEGMENTS")) {
+            DC_INFO("%s: segment type %#x vaddr %#llx memsz %#llx filesz %#llx flags %c%c%c -> "
+                    "mprotect %#llx-%#llx",
+                    name.c_str(), ph.p_type, static_cast<unsigned long long>(ph.p_vaddr),
+                    static_cast<unsigned long long>(ph.p_memsz),
+                    static_cast<unsigned long long>(ph.p_filesz), (ph.p_flags & PF_R) ? 'r' : '-',
+                    (ph.p_flags & PF_W) ? 'w' : '-', (ph.p_flags & PF_X) ? 'x' : '-',
+                    static_cast<unsigned long long>(start), static_cast<unsigned long long>(end));
+        }
         if (mprotect(reinterpret_cast<void*>(start), end - start, prot) != 0) {
             DC_WARN("%s: mprotect %#llx-%#llx failed", name.c_str(), start, end);
         }

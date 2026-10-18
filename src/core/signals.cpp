@@ -8,6 +8,8 @@
 #include <vector>
 
 #include <execinfo.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
@@ -132,9 +134,53 @@ bool PatchExtrq(VAddr site) {
     return true;
 }
 
+// Context of the fault being reported, for the register dump (the process is about to die).
+const ucontext_t* g_crash_ctx = nullptr;
+
+void DescribeRegion(const char* label, u64 addr) {
+    mach_vm_address_t a = addr;
+    mach_vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj;
+    if (mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
+                       reinterpret_cast<vm_region_info_t>(&info), &cnt, &obj) != KERN_SUCCESS) {
+        DC_ERROR("  %s: no mapping at or above %#llx", label, addr);
+        return;
+    }
+    DC_ERROR("  %s: %#llx-%#llx prot=%c%c%c max=%c%c%c%s", label, static_cast<u64>(a),
+             static_cast<u64>(a + sz), (info.protection & 1) ? 'r' : '-',
+             (info.protection & 2) ? 'w' : '-', (info.protection & 4) ? 'x' : '-',
+             (info.max_protection & 1) ? 'r' : '-', (info.max_protection & 2) ? 'w' : '-',
+             (info.max_protection & 4) ? 'x' : '-',
+             a > addr ? "  (address itself is unmapped)" : "");
+}
+
+void DumpRegisters(u64 fault_rip) {
+    if (g_crash_ctx) {
+        const auto& r = g_crash_ctx->uc_mcontext->__ss;
+        DC_ERROR("  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx", r.__rax, r.__rbx, r.__rcx,
+                 r.__rdx);
+        DC_ERROR("  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx", r.__rsi, r.__rdi, r.__rbp,
+                 r.__rsp);
+        DC_ERROR("  r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx", r.__r8, r.__r9, r.__r10,
+                 r.__r11);
+        DC_ERROR("  r12=%016llx r13=%016llx r14=%016llx r15=%016llx", r.__r12, r.__r13, r.__r14,
+                 r.__r15);
+        const u64* st = reinterpret_cast<const u64*>(r.__rsp);
+        for (int i = 0; i < 8 && r.__rsp > 0x10000 && (r.__rsp & 7) == 0; ++i) {
+            const std::string w = g_describer ? g_describer(st[i]) : std::string();
+            DC_ERROR("  [rsp+%#x] = %016llx %s", i * 8, st[i], w.c_str());
+        }
+    }
+    DescribeRegion("region at fault", fault_rip);
+    DescribeRegion("region before  ", fault_rip > 0x1000 ? fault_rip - 0x1000 : 0);
+}
+
 void Describe(const char* what, u64 rip, u64 fault, u64 rsp) {
     const std::string where = g_describer ? g_describer(rip) : std::string();
     DC_ERROR("%s at rip %#llx (%s), fault address %#llx", what, rip, where.c_str(), fault);
+    DumpRegisters(fault ? fault : rip);
     // Host frames (our code and system libraries).
     void* frames[32];
     const int n = backtrace(frames, 32);
@@ -189,6 +235,7 @@ void Handler(int sig, siginfo_t* info, void* raw) {
         }
     }
     auto* uc = static_cast<ucontext_t*>(raw);
+    g_crash_ctx = uc;
     const u64 rip = uc->uc_mcontext->__ss.__rip;
     const u64 rsp = uc->uc_mcontext->__ss.__rsp;
 

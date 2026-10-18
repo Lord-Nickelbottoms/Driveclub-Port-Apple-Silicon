@@ -81,7 +81,11 @@ int StartModule(const char* name, u64 args, const void* argp) {
     if (!m->HasInit()) {
         return 0;
     }
-    DC_INFO("starting module %s with args=%llu argp=%p", name, args, argp);
+    const u8* ip = reinterpret_cast<const u8*>(m->InitAddr());
+    DC_INFO("starting module %s with args=%llu argp=%p, init %#llx: %02x %02x %02x %02x %02x %02x "
+            "%02x %02x",
+            name, args, argp, static_cast<unsigned long long>(m->InitAddr()), ip[0], ip[1], ip[2],
+            ip[3], ip[4], ip[5], ip[6], ip[7]);
     using ModuleStart = int (*)(u64 args, const void* argp, void* param);
     const int ret = reinterpret_cast<ModuleStart>(m->InitAddr())(
         args, argp, reinterpret_cast<void*>(m->ProcParam()));
