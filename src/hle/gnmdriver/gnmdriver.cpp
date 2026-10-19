@@ -4,6 +4,8 @@
 #include "hle/gnmdriver/gnmdriver.h"
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -86,6 +88,51 @@ struct ComputeQueue {
 std::mutex g_queue_lock;
 std::unordered_map<u32, ComputeQueue> g_compute_queues;
 u32 g_next_vqid = 1;
+
+void TraceOversizedDispatch(const u32* words, u32 dwords, u32 vqid, const ComputeQueue& queue,
+                           u32 ring_offset_dw) {
+    static const bool trace = std::getenv("DC_CP_TRACE") != nullptr;
+    static std::atomic<bool> logged{false};
+    if (!trace || !words) {
+        return;
+    }
+
+    static std::atomic<bool> logged_submission{false};
+    if (!logged_submission.exchange(true, std::memory_order_relaxed)) {
+        DC_INFO("gnm: compute ring submit vqid=%u pipe=%u queue=%u "
+                "ring_offset_dw=%u dwords=%u",
+                vqid, queue.pipe_id, queue.queue_id, ring_offset_dw, dwords);
+    }
+
+    for (u32 offset = 0; offset < dwords;) {
+        const u32 header = words[offset];
+        const u32 type = HeaderType(header);
+        u32 packet_dwords = 1;
+        if (type == 0) {
+            packet_dwords += ((header >> 16) & 0x3FFF) + 1;
+        } else if (type == 3) {
+            const u32 body_dwords = HeaderBodyDwords(header);
+            packet_dwords += body_dwords;
+            if (HeaderOpcode(header) == Op::DispatchDirect && body_dwords >= 4 &&
+                packet_dwords <= dwords - offset &&
+                (words[offset + 1] > (1u << 20) || words[offset + 2] > (1u << 20) ||
+                 words[offset + 3] > (1u << 20)) &&
+                !logged.exchange(true, std::memory_order_relaxed)) {
+                DC_INFO("gnm: oversized compute dispatch vqid=%u pipe=%u queue=%u "
+                        "ring_offset_dw=%u range_offset_dw=%u packet_offset_dw=%u "
+                        "header=%#x dims=%#x,%#x,%#x",
+                        vqid, queue.pipe_id, queue.queue_id, ring_offset_dw + offset,
+                        ring_offset_dw, offset, header, words[offset + 1], words[offset + 2],
+                        words[offset + 3]);
+                return;
+            }
+        }
+        if (packet_dwords > dwords - offset) {
+            break;
+        }
+        offset += packet_dwords;
+    }
+}
 
 // ---------------------------------------------------------------- Gnm Events ----
 std::mutex g_event_lock;
@@ -434,10 +481,15 @@ void sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
     if (next_offs_dw > q.last_offs_dw) {
+        TraceOversizedDispatch(q.ring_base + q.last_offs_dw, next_offs_dw - q.last_offs_dw,
+                               gnm_vqid, q, q.last_offs_dw);
         Instance().SubmitCompute(gnm_vqid, {q.ring_base + q.last_offs_dw, next_offs_dw - q.last_offs_dw});
     } else {
         // Wrapped around ring buffer
+        TraceOversizedDispatch(q.ring_base + q.last_offs_dw, q.ring_size_dw - q.last_offs_dw,
+                               gnm_vqid, q, q.last_offs_dw);
         Instance().SubmitCompute(gnm_vqid, {q.ring_base + q.last_offs_dw, q.ring_size_dw - q.last_offs_dw});
+        TraceOversizedDispatch(q.ring_base, next_offs_dw, gnm_vqid, q, 0);
         Instance().SubmitCompute(gnm_vqid, {q.ring_base, next_offs_dw});
     }
     q.last_offs_dw = next_offs_dw;

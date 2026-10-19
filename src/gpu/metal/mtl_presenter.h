@@ -5,6 +5,7 @@
 // full three frames ahead.
 
 #include <memory>
+#include <cstdint>
 
 namespace Gpu::Metal {
 
@@ -31,8 +32,8 @@ public:
     // Placeholder frame: clears the drawable.
     void PresentClear(float r, float g, float b);
 
-    // Draws a finished frame (id<MTLTexture> as void*) scaled to the drawable.
-    void PresentTexture(void* texture_handle);
+    // Draws a renderer frame after its shared-event value is reached.
+    void PresentTexture(void* texture_handle, std::uint64_t ready_value);
 
 private:
     struct Impl;

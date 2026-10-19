@@ -245,6 +245,7 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> fill_pipeline = nil;
 
   // ---- recording ----
+  static constexpr u64 kMaxGuestCommandBuffersInFlight = 8;
   id<MTLCommandBuffer> cmd = nil;
   id<MTLCommandBuffer> last_committed = nil;
   id<MTLRenderCommandEncoder> enc = nil;
@@ -264,8 +265,10 @@ struct MetalRenderer::Impl {
   // Signals: an event value encoded between passes, so fences do not cut
   // command buffers. Callbacks run in order on the listener's queue.
   id<MTLSharedEvent> signal_event = nil;
+  id<MTLSharedEvent> frame_event = nil;
   MTLSharedEventListener *signal_listener = nil;
   u64 signal_value = 0;
+  u64 frame_ready_value = 0;
   std::mutex signal_lock;
   std::deque<std::pair<u64, std::function<void()>>> signal_queue;
 
@@ -355,6 +358,7 @@ struct MetalRenderer::Impl {
   // checked per frame in turn, one that did (glyph caches, streamed or
   // CPU-animated textures) is checked in full every frame it is used.
   static constexpr u64 kChunk = 64 << 10;
+  static constexpr u64 kTextureCacheIdleFrames = 300;
   struct TextureEntry {
     id<MTLTexture> tex = nil;
     id<MTLTexture> base_view = nil; // levels from the T# BASE_LEVEL
@@ -400,7 +404,8 @@ struct MetalRenderer::Impl {
       nil; // DC_DUMP_PASSES: x / (1 + x), NaN/Inf magenta
   id<MTLTexture> frames[3] = {nil, nil, nil};
   u32 frame_index = 0;
-  std::atomic<void *> latest_frame{nullptr};
+  std::mutex published_frame_lock;
+  MetalRenderer::PublishedFrame published_frame;
   u64 frame_count = 0;
 
   // ---- diagnostics ----
@@ -439,7 +444,7 @@ struct MetalRenderer::Impl {
   static constexpr u32 kProbeSlots = 4096;
   id<MTLTexture> pass_tex[9] = {};
   u64 pass_addr[9] = {};
-  bool stats = false;   // DC_GPU_STATS: per-second GPU time and submit counts
+  bool stats = false;   // DC_GPU_STATS: per-second GPU time and queue progress
   bool profile = false; // DC_GPU_PROFILE: GPU time per shader (one command
                         // buffer per call)
   struct ProfileEntry {
@@ -449,8 +454,12 @@ struct MetalRenderer::Impl {
   std::mutex profile_lock;
   std::unordered_map<std::string, ProfileEntry> profile_data;
   std::atomic<u64> gpu_ns{0};
+  std::atomic<u64> gpu_completed{0};
   u64 stat_hashed = 0;
+  u64 stat_total_commits = 0;
+  u64 stat_completed_last = 0;
   u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
+  u64 stat_texture_evictions = 0;
   double stat_wait_s = 0;
   std::chrono::steady_clock::time_point stat_t0 =
       std::chrono::steady_clock::now();
@@ -461,6 +470,13 @@ struct MetalRenderer::Impl {
     if (reported.insert(what).second) {
       DC_WARN("gpu: %s", what.c_str());
     }
+  }
+
+  static bool SupportsTextureAtomics() {
+    if (@available(macOS 14.0, *)) {
+      return true;
+    }
+    return false;
   }
 
   // ================= setup =================
@@ -740,9 +756,23 @@ struct MetalRenderer::Impl {
   // ================= recording =================
 
   void EnsureCommandBuffer() {
-    if (!cmd) {
-      cmd = [queue commandBuffer];
+    if (cmd) {
+      return;
     }
+    // Metal command buffers on one queue complete in order, but the queue still
+    // stalls if the CPU keeps creating new buffers after the GPU has fallen far
+    // behind. Guard the renderer's in-flight count so we back off and drain the
+    // queue before trying to record the next frame.
+    while (true) {
+      const u64 completed = gpu_completed.load(std::memory_order_acquire);
+      const u64 outstanding =
+          stat_total_commits > completed ? stat_total_commits - completed : 0;
+      if (outstanding < kMaxGuestCommandBuffersInFlight) {
+        break;
+      }
+      WaitLast();
+    }
+    cmd = [queue commandBuffer];
   }
 
   void EndPass() {
@@ -884,12 +914,23 @@ struct MetalRenderer::Impl {
         arena_released.store(head, std::memory_order_release);
       }];
     }
+    ++stat_total_commits;
     if (stats) {
       ++stat_commits;
-      [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        gpu_ns += static_cast<u64>((c.GPUEndTime - c.GPUStartTime) * 1e9);
-      }];
     }
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+      if (c.status == MTLCommandBufferStatusError) {
+        NSError *error = c.error;
+        DC_ERROR("gpu: command buffer failed: %s",
+                 error ? error.localizedDescription.UTF8String : "unknown error");
+      }
+      if (stats && c.status == MTLCommandBufferStatusCompleted) {
+        gpu_ns.fetch_add(
+            static_cast<u64>((c.GPUEndTime - c.GPUStartTime) * 1e9),
+            std::memory_order_relaxed);
+      }
+      gpu_completed.fetch_add(1, std::memory_order_relaxed);
+    }];
     [cmd commit];
     last_committed = cmd;
     cmd = nil;
@@ -1310,7 +1351,7 @@ struct MetalRenderer::Impl {
 
   // Decodes a T# and returns a Metal texture for it.
   id<MTLTexture> GetTexture(const u32 t[8], TextureType *type_out,
-                            bool storage = false) {
+                            bool storage = false, bool atomic = false) {
     const u64 addr =
         ((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask;
     const u32 dfmt = (t[1] >> 20) & 0x3F;
@@ -1330,6 +1371,14 @@ struct MetalRenderer::Impl {
     const TextureFormatInfo fi = TextureFormat(dfmt, nfmt);
     TextureType tt;
     tt.sample = fi.sample;
+    tt.atomic = atomic && SupportsTextureAtomics() &&
+                (fi.format == MTLPixelFormatR32Uint ||
+                 fi.format == MTLPixelFormatR32Sint);
+    if (atomic && !tt.atomic) {
+      ReportOnce("image atomic texture format not supported (dfmt=" +
+                 std::to_string(dfmt) + " nfmt=" + std::to_string(nfmt) +
+                 " addr=" + std::to_string(addr) + ")");
+    }
     if (ttype == 10) {
       tt.dim = TexDim::Tex3D;
     } else if (ttype == 11 || ttype == 12 || ttype == 13 || ttype == 15) {
@@ -1358,6 +1407,17 @@ struct MetalRenderer::Impl {
           p->initialized = true;
           p->clear_pending = false;
           p->written = ++write_seq;
+          if (atomic) {
+            tt.sample = SampleKind(p->tex.pixelFormat);
+            tt.atomic =
+                SupportsTextureAtomics() &&
+                (p->tex.pixelFormat == MTLPixelFormatR32Uint ||
+                 p->tex.pixelFormat == MTLPixelFormatR32Sint);
+            if (!tt.atomic) {
+              ReportOnce("image atomic render target format not supported");
+            }
+            *type_out = tt;
+          }
           type_out->ufloat = p->tex.pixelFormat == MTLPixelFormatRG11B10Float;
           return TargetView(*p, lv + base_level, 1, MTLPixelFormatInvalid,
                             base_array, slice_count);
@@ -1436,6 +1496,14 @@ struct MetalRenderer::Impl {
       const MTLPixelFormat f = fi.format == MTLPixelFormatRGBA8Unorm_sRGB
                                    ? MTLPixelFormatRGBA8Unorm
                                    : fi.format;
+      tt.sample = SampleKind(f);
+      tt.atomic = atomic && SupportsTextureAtomics() &&
+                  (f == MTLPixelFormatR32Uint ||
+                   f == MTLPixelFormatR32Sint);
+      if (atomic && !tt.atomic && fi.format != MTLPixelFormatInvalid) {
+        ReportOnce("image atomic storage format not supported");
+      }
+      *type_out = tt;
       type_out->ufloat = f == MTLPixelFormatRG11B10Float;
       // A new image starts as its guest memory (shadPS4 uploads an image
       // before a shader writes it): a shader may write only part of it, and
@@ -1715,6 +1783,10 @@ struct MetalRenderer::Impl {
                     : MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                           MTLTextureUsageShaderWrite |
                           MTLTextureUsagePixelFormatView;
+    }
+    if (SupportsTextureAtomics() &&
+        (fmt == MTLPixelFormatR32Uint || fmt == MTLPixelFormatR32Sint)) {
+      d.usage |= MTLTextureUsageShaderAtomic;
     }
     return [device newTextureWithDescriptor:d];
   }
@@ -2062,7 +2134,7 @@ struct MetalRenderer::Impl {
         t[k] = Shader::ResolveSgpr(img.tsharp[k], ud);
       }
       TextureType tt;
-      id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
+      id<MTLTexture> tex = GetTexture(t, &tt, img.storage, img.atomic);
       if (trace && (t[0] == 0 || std::getenv("DC_TRACE_TSHARP"))) {
         DC_INFO("gpu:   T# %08x %08x %08x %08x %08x %08x %08x %08x src kind %u "
                 "ud %u off %u",
@@ -3170,6 +3242,22 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   if (!addr || !gx || !gy || !gz) {
     return;
   }
+  static const bool skip_huge_dispatch =
+      std::getenv("DC_SKIP_HUGE_DISPATCH") != nullptr;
+  constexpr u32 kMaxDiagnosticDispatchDimension = 1u << 20;
+  if (skip_huge_dispatch &&
+      (gx > kMaxDiagnosticDispatchDimension ||
+       gy > kMaxDiagnosticDispatchDimension ||
+       gz > kMaxDiagnosticDispatchDimension)) {
+    DC_WARN("gpu: skipping oversized dispatch cs=%#llx groups %ux%ux%u "
+            "(DC_SKIP_HUGE_DISPATCH)",
+            addr, gx, gy, gz);
+    if (dump_dir) {
+      GetProgram(Stage::Compute, addr, ud, Bits(rsrc2, 1, 5),
+                 Bits(rsrc2, 11, 2), rsrc2);
+    }
+    return;
+  }
   ++stat_dispatches;
   if (trace) {
     static const u64 peek_cs =
@@ -3411,6 +3499,16 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
 
 void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   ++frame_count;
+  if (frame_count % 60 == 0) {
+    for (auto it = textures.begin(); it != textures.end();) {
+      if (frame_count - it->second.frame >= kTextureCacheIdleFrames) {
+        it = textures.erase(it);
+        ++stat_texture_evictions;
+      } else {
+        ++it;
+      }
+    }
+  }
   if (trace_frame) {
     trace = frame_count == trace_frame;
   }
@@ -3420,16 +3518,28 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     static u64 frames = 0;
     ++frames;
     if (dt >= 1.0) {
+      const u64 completed = gpu_completed.load(std::memory_order_relaxed);
+      const u64 completed_since_last = completed - stat_completed_last;
+      const u64 outstanding =
+          stat_total_commits > completed ? stat_total_commits - completed : 0;
       DC_INFO(
           "gpu stats: %.1f fps, gpu busy %.0f%%, wait %.0f%%, per frame: %.0f "
           "draws %.0f dispatches %.1f commits %.1f waits %.1f MB hashed, "
-          "%zu pipelines compiling",
+          "%zu textures, %llu evicted, %zu pipelines compiling, "
+          "%llu command buffers submitted, %llu completed, %llu outstanding",
           frames / dt, gpu_ns.exchange(0) / 1e9 / dt * 100,
           stat_wait_s / dt * 100, stat_draws / double(frames),
           stat_dispatches / double(frames), stat_commits / double(frames),
           stat_waits / double(frames),
-          stat_hashed / double(frames) / (1 << 20), pending.size());
+          stat_hashed / double(frames) / (1 << 20), textures.size(),
+          static_cast<unsigned long long>(stat_texture_evictions),
+          pending.size(),
+          static_cast<unsigned long long>(stat_total_commits),
+          static_cast<unsigned long long>(completed_since_last),
+          static_cast<unsigned long long>(outstanding));
       stat_hashed = 0;
+      stat_texture_evictions = 0;
+      stat_completed_last = completed;
       frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
       if (profile) {
         ProfileReport();
@@ -3544,9 +3654,17 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
       q = *end ? end + 1 : end;
     }
   }
+  u64 ready_value = 0;
+  if (src) {
+    ready_value = ++frame_ready_value;
+    [cmd encodeSignalEvent:frame_event value:ready_value];
+  }
   Commit(false);
   if (src) {
-    latest_frame.store((__bridge void *)dst, std::memory_order_release);
+    {
+      std::scoped_lock lk(published_frame_lock);
+      published_frame = {(__bridge void *)dst, ready_value};
+    }
     frame_index = (frame_index + 1) % 3;
   }
   if (frame_count <= 3 || frame_count % 300 == 0) {
@@ -3559,6 +3677,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
 MetalRenderer::MetalRenderer(Device &device) : impl(std::make_unique<Impl>()) {
   impl->device = (__bridge id<MTLDevice>)device.Handle();
   impl->queue = (__bridge id<MTLCommandQueue>)device.Queue();
+  impl->frame_event = (__bridge id<MTLSharedEvent>)device.FrameEvent();
   impl->Init();
 }
 
@@ -3650,8 +3769,9 @@ std::uint8_t *MetalRenderer::Gds() {
   return static_cast<std::uint8_t *>(impl->gds.contents);
 }
 
-void *MetalRenderer::LatestFrame() const {
-  return impl->latest_frame.load(std::memory_order_acquire);
+MetalRenderer::PublishedFrame MetalRenderer::LatestFrame() const {
+  std::scoped_lock lk(impl->published_frame_lock);
+  return impl->published_frame;
 }
 
 } // namespace Gpu::Metal

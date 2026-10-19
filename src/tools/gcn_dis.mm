@@ -60,6 +60,12 @@ int main(int argc, char** argv) {
         o.ps_input_cntl[k] = k;
     }
     o.textures.resize(prog->images.size());
+    for (u32 k = 0; k < prog->images.size(); ++k) {
+        if (prog->images[k].atomic) {
+            o.textures[k].sample = TexSample::Uint;
+            o.textures[k].atomic = true;
+        }
+    }
     std::vector<std::string> unsupported;
     const std::string src = GenerateMsl(*prog, o, &unsupported);
     if (print_msl) {
@@ -73,6 +79,11 @@ int main(int argc, char** argv) {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         MTLCompileOptions* opts = [MTLCompileOptions new];
         opts.mathMode = MTLMathModeSafe;
+        if (@available(macOS 14.0, *)) {
+            opts.languageVersion = MTLLanguageVersion3_1;
+        } else {
+            opts.languageVersion = MTLLanguageVersion3_0;
+        }
         NSError* err = nil;
         id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
                                                options:opts

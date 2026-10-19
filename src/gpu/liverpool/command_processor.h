@@ -99,7 +99,8 @@ private:
     Ring& GetRing(u32 index);
     void Push(u32 ring, Job job);
     void Run(Ring& ring, std::stop_token stop);
-    void Execute(std::span<const u32> cmds, bool compute, int depth);
+    void Execute(std::span<const u32> cmds, bool compute, int depth,
+                 const u32* parent_stream = nullptr, const u32* parent_ib_packet = nullptr);
     void Interrupt(u32 irq);
     void SetRegs(u32 index, const u32* values, u32 count);
     void Draw(bool indexed, u32 count, u32 index_offset, u32 first_vertex, u32 instances);

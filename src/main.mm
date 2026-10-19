@@ -69,7 +69,6 @@ int Run(int argc, char** argv) {
 
     Core::Signals::Install(
         [](u64 address) { return Core::Loader::Linker::Instance()->Describe(address); });
-    Core::Runtime::StartGame(linker);
 
     SDL_Window* window =
         SDL_CreateWindow("Driveclub Native", kWindowWidth, kWindowHeight,
@@ -92,10 +91,13 @@ int Run(int argc, char** argv) {
     SDL_GetWindowSizeInPixels(window, &w, &h);
     presenter->Resize(w, h);
 
+    Core::Runtime::StartGame(linker);
+
     using Clock = std::chrono::steady_clock;
     const auto start = Clock::now();
     auto fps_window = start;
-    int frames = 0;
+    std::uint64_t last_ready_value = 0;
+    int game_frames = 0;
 
     bool running = true;
     while (running) {
@@ -211,23 +213,27 @@ int Run(int argc, char** argv) {
             }
         }
 
-        if (void* tex = renderer->LatestFrame()) {
-            presenter->PresentTexture(tex);
+        const auto frame = renderer->LatestFrame();
+        if (frame.texture) {
+            presenter->PresentTexture(frame.texture, frame.ready_value);
+            if (frame.ready_value > last_ready_value) {
+                ++game_frames;
+                last_ready_value = frame.ready_value;
+            }
         } else {
             const float t = std::chrono::duration<float>(Clock::now() - start).count();
             presenter->PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);
         }
 
-        ++frames;
         const auto now = Clock::now();
         if (now - fps_window >= std::chrono::seconds(1)) {
             const double secs = std::chrono::duration<double>(now - fps_window).count();
-            const double fps = frames / secs;
+            const double fps = game_frames / secs;
             char title[96];
-            std::snprintf(title, sizeof(title), "Driveclub Native | %s | %.0f FPS",
+            std::snprintf(title, sizeof(title), "Driveclub Native | %s | %.0f guest FPS",
                           gpu_name.c_str(), fps);
             SDL_SetWindowTitle(window, title);
-            frames = 0;
+            game_frames = 0;
             fps_window = now;
         }
     }

@@ -2,6 +2,7 @@
 
 #include "hle/playgo/playgo.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "common/log.h"
@@ -46,7 +47,10 @@ s32 scePlayGoGetLocus(OrbisPlayGoHandle handle, const OrbisPlayGoChunkId* chunkI
         // All chunks are extracted and present locally on disk
         outLoci[i] = OrbisPlayGoLocus::LocalFast;
     }
-    DC_INFO("scePlayGoGetLocus(count=%u) -> all LocalFast", count);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        DC_INFO("scePlayGoGetLocus(count=%u) -> all LocalFast", count);
+    }
     return 0;
 }
 
@@ -58,7 +62,11 @@ s32 scePlayGoGetInstallSpeed(OrbisPlayGoHandle handle, OrbisPlayGoInstallSpeed* 
 }
 
 s32 scePlayGoSetInstallSpeed(OrbisPlayGoHandle handle, OrbisPlayGoInstallSpeed speed) {
-    DC_INFO("scePlayGoSetInstallSpeed(speed=%d)", static_cast<s32>(speed));
+    static std::atomic<s32> logged_speed{-1};
+    const s32 value = static_cast<s32>(speed);
+    if (logged_speed.exchange(value, std::memory_order_relaxed) != value) {
+        DC_INFO("scePlayGoSetInstallSpeed(speed=%d)", value);
+    }
     return 0;
 }
 

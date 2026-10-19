@@ -37,6 +37,7 @@ constexpr u32 EventWriteEos = 0x48;
 constexpr u32 ReleaseMem = 0x49;
 constexpr u32 DmaData = 0x50;
 constexpr u32 AcquireMem = 0x58;
+constexpr u32 Rewind = 0x59;
 constexpr u32 SetConfigReg = 0x68;
 constexpr u32 SetContextReg = 0x69;
 constexpr u32 SetShReg = 0x76;

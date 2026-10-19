@@ -51,7 +51,22 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the 
 
 - Shader IR -> MSL directly, without SPIR-V/SPIRV-Cross; disk cache for compiled pipelines.
 - Argument buffers Tier 2 (bindless) - minimal resource binding overhead per draw.
-- Up to 3 frames in flight; CPU waits for GPU only when running 3 frames ahead.
+- Guest rendering is capped at 8 in-flight command buffers; presentation has a separate
+  queue and shared-event synchronization, isolated from guest queue backpressure.
+- Up to 3 drawable frames are in flight; presentation skips frames rather than waiting
+  for a presentation slot. `DC_GPU_STATS=1` reports guest command-buffer progress.
+- `DC_SKIP_HUGE_DISPATCH=1` is a diagnostic switch that skips compute dispatches with
+  any group dimension above 1,048,576; it is disabled by default. Combining it with
+  `DC_DUMP_SHADERS=<dir>` dumps the shader binaries for skipped dispatches as well.
+  With `DC_CP_TRACE=1`, the first oversized direct PM4 dispatch also logs its raw
+  header, dimensions, initiator, nesting depth, and stream offset. The compute-ring
+  trace reports the first ring submission. For a nested oversized dispatch, the CP
+  trace also reports the indirect-buffer descriptor words, decoded address/size,
+  and stream pointer used for execution. First-seen unhandled packets include their
+  header, first body word, stream offset, and nesting depth. PM4 `REWIND` traces
+  report the initial payload/valid bit and whether the parser waits; the parser
+  submits pending renderer work when the valid bit is unset, then waits before
+  processing subsequent commands.
 - On discrete AMD GPUs, memory is not unified: dirty page tracking and uploading modified ranges only.
 - Explicit discrete GPU selection on dual-GPU MacBooks (`DC_GPU=<partial_name>` override).
 
@@ -62,6 +77,14 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the 
 - M-Series Mac (Testing on MacBook Pro M2 8GB)
 - Xcode, CMake >= 3.24, Ninja, SDL3 (`brew install cmake ninja sdl3`)
 - Your own copy of the game as a decrypted dump (fSELF/fPKG)
+
+On Apple Silicon, this backend runs as x86-64 under Rosetta 2. The guest 64-GB+ address
+range is disabled by default because it overlaps Rosetta's reserved address space; advisory
+allocations are placed in the lower guest ranges. This is separate from the PS4-compatible
+5.1-GiB guest memory limit, whose pages are backed as the game uses them rather than committed
+all at startup. Lowering that limit can make game allocations fail without reducing the initial
+memory footprint.
+Integer image atomics use Metal Shading Language 3.1 and require macOS 14 or newer.
 
 **Windows**
 

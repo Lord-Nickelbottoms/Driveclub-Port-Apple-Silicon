@@ -1,6 +1,6 @@
 #pragma once
 
-// Owns the MTLDevice and the single command queue all GPU work goes through.
+// Owns the MTLDevice and Metal queues for guest rendering and presentation.
 // The header stays pure C++ so non-Metal code can hold a Device without ObjC.
 
 #include <cstdint>
@@ -31,6 +31,8 @@ public:
     // Opaque id<MTLDevice> / id<MTLCommandQueue>, bridged in .mm files.
     void* Handle() const;
     void* Queue() const;
+    void* PresentQueue() const;
+    void* FrameEvent() const;
 
 private:
     struct Impl;

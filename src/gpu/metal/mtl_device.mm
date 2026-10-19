@@ -9,9 +9,18 @@
 
 namespace Gpu::Metal {
 
+namespace {
+
+constexpr NSUInteger kMaxCommandBuffersInFlight = 8;
+constexpr NSUInteger kMaxPresenterCommandBuffersInFlight = 3;
+
+} // namespace
+
 struct Device::Impl {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    id<MTLCommandQueue> present_queue;
+    id<MTLSharedEvent> frame_event;
 };
 
 static id<MTLDevice> PickDevice() {
@@ -47,9 +56,16 @@ Device::Device() : impl(std::make_unique<Impl>()) {
     if (!impl->device) {
         throw std::runtime_error("no Metal 3 capable GPU found");
     }
-    // One queue for everything keeps ordering trivial; the PS4 compute rings
-    // get mapped onto it later.
-    impl->queue = [impl->device newCommandQueueWithMaxCommandBufferCount:64];
+    // Guest compute and graphics share a queue; presentation gets independent
+    // command-buffer slots so guest backpressure cannot consume them.
+    impl->queue = [impl->device
+        newCommandQueueWithMaxCommandBufferCount:kMaxCommandBuffersInFlight];
+    impl->present_queue = [impl->device
+        newCommandQueueWithMaxCommandBufferCount:kMaxPresenterCommandBuffersInFlight];
+    impl->frame_event = [impl->device newSharedEvent];
+    if (!impl->queue || !impl->present_queue || !impl->frame_event) {
+        throw std::runtime_error("cannot create Metal command queues or frame event");
+    }
 
     id<MTLDevice> dev = impl->device;
     info.name = dev.name.UTF8String;
@@ -70,6 +86,14 @@ void* Device::Handle() const {
 
 void* Device::Queue() const {
     return (__bridge void*)impl->queue;
+}
+
+void* Device::PresentQueue() const {
+    return (__bridge void*)impl->present_queue;
+}
+
+void* Device::FrameEvent() const {
+    return (__bridge void*)impl->frame_event;
 }
 
 } // namespace Gpu::Metal

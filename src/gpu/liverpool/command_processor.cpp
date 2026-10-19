@@ -399,7 +399,8 @@ void CommandProcessor::Interrupt(u32 irq) {
     }
 }
 
-void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int depth) {
+void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int depth,
+                               const u32* parent_stream, const u32* parent_ib_packet) {
     RegFile& regs = CurRegs();
     const u32* p = cmds.data();
     const u32* end = p + cmds.size();
@@ -482,7 +483,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32* ib = Ptr<const u32>(body[0], body[1] & 0xFFFF);
             const u32 size = body[2] & 0xFFFFF;
             if (depth < 4) {
-                Execute({ib, size}, compute, depth + 1);
+                Execute({ib, size}, compute, depth + 1, cmds.data(), p);
             }
             break;
         }
@@ -581,11 +582,16 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             const u32 mask = body[4];
             if (memory) {
                 const volatile u32* addr = Ptr<const u32>(body[1] & ~3u, body[2]);
-                if (Compare(func, *addr & mask, ref)) {
-                    break;
-                }
-                u32 pending = 0;
-                if (PendingFence(reinterpret_cast<u64>(addr), &pending) && Compare(func, pending & mask, ref)) {
+                const u64 addr_value = reinterpret_cast<u64>(addr);
+                auto satisfied = [&] {
+                    if (Compare(func, *addr & mask, ref)) {
+                        return true;
+                    }
+                    u32 pending = 0;
+                    return PendingFence(addr_value, &pending) &&
+                           Compare(func, pending & mask, ref);
+                };
+                if (satisfied()) {
                     break;
                 }
                 // Whatever produces the value may sit in recorded host work.
@@ -593,7 +599,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     renderer->OnSubmit();
                 }
                 u32 iters = 0;
-                while (!Compare(func, *addr & mask, ref)) {
+                while (!satisfied()) {
                     if (++iters > 1000000) {
                         DC_WARN("gpu: WaitRegMem timeout (addr=%p val=%#x ref=%#x mask=%#x func=%u)",
                                 addr, *addr, ref, mask, func);
@@ -664,8 +670,72 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             break;
         }
 
+        case Op::Rewind: {
+            if (body_n < 1) {
+                break;
+            }
+
+            constexpr u32 kRewindValid = 1u << 31;
+            const volatile u32* rewind = body;
+            u32 value = *rewind;
+            const bool waited = !(value & kRewindValid);
+            if (trace) {
+                DC_INFO("gpu: CP%s REWIND begin header=%#x payload=%#x "
+                        "valid=%u waiting=%u stream=%p offset_dw=%zu depth=%d",
+                        compute ? " compute" : "", header, value,
+                        (value & kRewindValid) != 0, waited,
+                        static_cast<const void*>(cmds.data()),
+                        static_cast<size_t>(p - cmds.data()), depth);
+            }
+            if (waited && renderer) {
+                renderer->OnSubmit();
+            }
+            while (!(value & kRewindValid)) {
+                sched_yield();
+                value = *rewind;
+            }
+            if (trace && waited) {
+                DC_INFO("gpu: CP%s REWIND became-valid payload=%#x "
+                        "stream=%p offset_dw=%zu depth=%d",
+                        compute ? " compute" : "", value,
+                        static_cast<const void*>(cmds.data()),
+                        static_cast<size_t>(p - cmds.data()), depth);
+            }
+            break;
+        }
+
         case Op::DispatchDirect:
             ++stats.dispatches;
+            if (trace && body_n >= 4 &&
+                (body[0] > (1u << 20) || body[1] > (1u << 20) ||
+                 body[2] > (1u << 20))) {
+                static std::atomic<bool> logged_oversized_dispatch{false};
+                if (!logged_oversized_dispatch.exchange(
+                        true, std::memory_order_relaxed)) {
+                    DC_INFO("gpu: CP dispatch-direct header=%#x shader=%#llx "
+                            "dims=%#x,%#x,%#x initiator=%#x ring=%s depth=%d "
+                            "stream=%p offset_dw=%zu",
+                            header,
+                            regs.ProgramAddr(Reg::COMPUTE_PGM_LO),
+                            body[0], body[1], body[2], body[3],
+                            compute ? "compute" : "graphics", depth,
+                            static_cast<const void*>(cmds.data()),
+                            static_cast<size_t>(p - cmds.data()));
+                    if (parent_ib_packet && parent_stream) {
+                        const u32* ib_body = parent_ib_packet + 1;
+                        const u64 ib_addr = u64(ib_body[0]) | (u64(ib_body[1] & 0xFFFF) << 32);
+                        DC_INFO("gpu: CP dispatch source-ib stream=%p packet_offset_dw=%zu "
+                                "raw=%#x,%#x,%#x addr=%#llx size_dw=%u "
+                                "executed_stream=%p",
+                                static_cast<const void*>(parent_stream),
+                                static_cast<size_t>(parent_ib_packet - parent_stream),
+                                ib_body[0], ib_body[1], ib_body[2],
+                                static_cast<unsigned long long>(ib_addr),
+                                ib_body[2] & 0xFFFFF,
+                                static_cast<const void*>(cmds.data()));
+                    }
+                }
+            }
             if (renderer) {
                 renderer->Dispatch(regs, body[0], body[1], body[2]);
             }
@@ -684,7 +754,11 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 static std::atomic<u64> seen[4]{};
                 const u64 bit = 1ull << (op & 63);
                 if (!(seen[op >> 6].fetch_or(bit) & bit)) {
-                    DC_INFO("gpu: CP%s: unhandled PM4 opcode %#x (%u dwords)", compute ? " compute" : "", op, body_n);
+                    DC_INFO("gpu: CP%s: unhandled PM4 opcode %#x (%u dwords) "
+                            "header=%#x first=%#x stream=%p offset_dw=%zu depth=%d",
+                            compute ? " compute" : "", op, body_n, header,
+                            body_n ? body[0] : 0, static_cast<const void*>(cmds.data()),
+                            static_cast<size_t>(p - cmds.data()), depth);
                 }
             }
             break;

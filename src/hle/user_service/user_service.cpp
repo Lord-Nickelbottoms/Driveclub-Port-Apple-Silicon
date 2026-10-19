@@ -2,6 +2,7 @@
 
 #include "hle/user_service/user_service.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -37,7 +38,11 @@ s32 sceUserServiceGetLoginUserIdList(s32* outUserIdList) {
         outUserIdList[2] = -1;
         outUserIdList[3] = -1;
     }
-    DC_INFO("sceUserServiceGetLoginUserIdList() -> [%#x, -1, -1, -1]", kInitialUserId);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        DC_INFO("sceUserServiceGetLoginUserIdList() -> [%#x, -1, -1, -1]",
+                kInitialUserId);
+    }
     return 0;
 }
 

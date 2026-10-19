@@ -37,16 +37,19 @@ fragment float4 fs_present(VertexOut in [[stage_in]],
 struct Presenter::Impl {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    id<MTLSharedEvent> frame_event;
     CAMetalLayer* layer;
     id<MTLRenderPipelineState> pipeline;
     id<MTLSamplerState> sampler;
     dispatch_semaphore_t frames_in_flight;
+    std::uint64_t last_frame_value = 0;
 };
 
 Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
     : impl(std::make_unique<Impl>()) {
     impl->device = (__bridge id<MTLDevice>)device.Handle();
-    impl->queue = (__bridge id<MTLCommandQueue>)device.Queue();
+    impl->queue = (__bridge id<MTLCommandQueue>)device.PresentQueue();
+    impl->frame_event = (__bridge id<MTLSharedEvent>)device.FrameEvent();
     impl->layer = (__bridge CAMetalLayer*)layer;
     impl->frames_in_flight = dispatch_semaphore_create(kFramesInFlight);
 
@@ -103,7 +106,9 @@ void Presenter::SetVsync(bool enabled) {
 }
 
 void Presenter::PresentClear(float r, float g, float b) {
-    dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
+    if (dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_NOW) != 0) {
+        return;
+    }
 
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [impl->layer nextDrawable];
@@ -131,13 +136,17 @@ void Presenter::PresentClear(float r, float g, float b) {
     }
 }
 
-void Presenter::PresentTexture(void* texture_handle) {
-    if (!texture_handle || !impl->pipeline) {
+void Presenter::PresentTexture(void* texture_handle, std::uint64_t ready_value) {
+    if (!texture_handle || !impl->pipeline ||
+        ready_value <= impl->last_frame_value ||
+        impl->frame_event.signaledValue < ready_value) {
         return;
     }
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture_handle;
 
-    dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
+    if (dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_NOW) != 0) {
+        return;
+    }
 
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [impl->layer nextDrawable];
@@ -152,6 +161,7 @@ void Presenter::PresentTexture(void* texture_handle) {
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
         id<MTLCommandBuffer> cmd = [impl->queue commandBuffer];
+        [cmd encodeWaitForEvent:impl->frame_event value:ready_value];
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
         [enc setRenderPipelineState:impl->pipeline];
         [enc setFragmentTexture:tex atIndex:0];
@@ -165,6 +175,7 @@ void Presenter::PresentTexture(void* texture_handle) {
         }];
         [cmd presentDrawable:drawable];
         [cmd commit];
+        impl->last_frame_value = ready_value;
     }
 }
 

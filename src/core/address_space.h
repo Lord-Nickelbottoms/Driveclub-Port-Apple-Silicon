@@ -19,8 +19,15 @@ constexpr VAddr kSystemManagedMax = 0x7FFFFC000;
 constexpr VAddr kSystemReservedMin = 0x7FFFFC000;
 constexpr VAddr kSystemReservedMax = 0xFC0000000;
 // Direct and flexible memory mappings; games use fixed addresses from 64 GB up.
+#ifndef DC_GUEST_USER_MAX
+#define DC_GUEST_USER_MAX 0x600000000000
+#endif
 constexpr VAddr kUserMin = 0x1000000000;
-constexpr VAddr kUserMax = 0x600000000000;
+#ifdef DC_NO_GUEST_USER
+constexpr VAddr kUserMax = kUserMin;
+#else
+constexpr VAddr kUserMax = DC_GUEST_USER_MAX;
+#endif
 
 enum class Prot : int { None = 0, Read = 1, Write = 2, Exec = 4, ReadWrite = 3 };
 

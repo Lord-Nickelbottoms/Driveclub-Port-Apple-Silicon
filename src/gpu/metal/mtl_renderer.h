@@ -4,6 +4,7 @@
 // render targets and textures as Metal textures, and records draws.
 
 #include <memory>
+#include <cstdint>
 
 #include "gpu/renderer.h"
 
@@ -13,6 +14,11 @@ class Device;
 
 class MetalRenderer : public Gpu::Renderer {
 public:
+    struct PublishedFrame {
+        void* texture = nullptr;
+        std::uint64_t ready_value = 0;
+    };
+
     explicit MetalRenderer(Device& device);
     ~MetalRenderer() override;
 
@@ -29,9 +35,9 @@ public:
                  std::uint32_t bytes) override;
     std::uint8_t* Gds() override;
 
-    // Main thread: the last flipped frame as id<MTLTexture> (void*), or null.
-    // It stays valid until two more flips have happened.
-    void* LatestFrame() const;
+    // Main thread: the last flipped texture and the event value that makes it
+    // safe to sample on the presentation queue.
+    PublishedFrame LatestFrame() const;
 
 private:
     struct Impl;

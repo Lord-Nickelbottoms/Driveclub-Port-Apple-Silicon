@@ -59,7 +59,11 @@ id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 ad
     }
     MTLCompileOptions* opts = [MTLCompileOptions new];
     opts.mathMode = MTLMathModeSafe;
-    opts.languageVersion = MTLLanguageVersion3_0;
+    if (@available(macOS 14.0, *)) {
+        opts.languageVersion = MTLLanguageVersion3_1;
+    } else {
+        opts.languageVersion = MTLLanguageVersion3_0;
+    }
     NSError* err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:opts error:&err];
     id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"main0"] : nil;

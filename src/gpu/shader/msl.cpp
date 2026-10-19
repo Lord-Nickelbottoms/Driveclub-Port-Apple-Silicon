@@ -1140,6 +1140,21 @@ void Emitter::EmitImage(const Inst& i) {
         if (tt.dim == TexDim::Tex2DArray) return "uint2(" + VName(a) + ", " + VName(a + 1) + "), " + VName(a + 2);
         return "uint3(" + VName(a) + ", " + VName(a + 1) + ", " + VName(a + 2) + ")";
     };
+    if (op == Mimg::IMAGE_ATOMIC_ADD) {
+        if (!tt.atomic || (tt.sample != TexSample::Uint && tt.sample != TexSample::Sint) ||
+            !(i.dmask & 1)) {
+            Unsupported(i);
+            return;
+        }
+        const bool is_signed = tt.sample == TexSample::Sint;
+        const std::string scalar = is_signed ? "int(" + VName(i.vdata) + ")"
+                                             : VName(i.vdata);
+        const std::string vector = is_signed ? "int4" : "uint4";
+        const std::string result = t + ".atomic_fetch_add(" + int_coord(i.vaddr) + ", " +
+                                   vector + "(" + scalar + ", 0, 0, 0))[0]";
+        SetV(i.vdata, "as_type<uint>(" + result + ")");
+        return;
+    }
     if (op == Mimg::IMAGE_STORE || op == Mimg::IMAGE_STORE_MIP) {
         // Data registers hold the components selected by dmask, in order.
         std::string comps[4] = {"0u", "0u", "0u", "0u"};
