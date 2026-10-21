@@ -85,6 +85,7 @@ struct MslOptions {
     u32 col_format = 0;                  // SPI_SHADER_COL_FORMAT
     std::array<OutType, 8> mrt_type{};
     u32 mrt_ufloat = 0; // MRTs stored as unsigned small floats (R11G11B10)
+    bool dual_source_blend = false; // MRT1 is the secondary source for MRT0 blending
     bool depth_target = true; // false drops depth exports (no depth attachment)
     // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at
     // texture(kDepthBoundsTexture)) is outside [min, max] (buffer(kDepthBoundsBuffer)).

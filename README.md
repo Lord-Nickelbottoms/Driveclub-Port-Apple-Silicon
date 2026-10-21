@@ -53,6 +53,8 @@ Gnm/Gnmx are embedded directly into eboot: the game writes PM4 packets into the 
 - Argument buffers Tier 2 (bindless) - minimal resource binding overhead per draw.
 - Guest rendering is capped at 8 in-flight command buffers; presentation has a separate
   queue and shared-event synchronization, isolated from guest queue backpressure.
+- GCN dual-source blending maps the shader's MRT1 export to Metal color 0, index 1
+  when render target 0 uses a source-1 blend factor.
 - Up to 3 drawable frames are in flight; presentation skips frames rather than waiting
   for a presentation slot. `DC_GPU_STATS=1` reports guest command-buffer progress.
 - `DC_SKIP_HUGE_DISPATCH=1` is a diagnostic switch that skips compute dispatches with

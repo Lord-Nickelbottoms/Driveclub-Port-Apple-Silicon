@@ -1717,7 +1717,12 @@ std::string Emitter::Run() {
         for (u32 k = 0; k < 8; ++k) {
             if ((p.mrt_mask & (1u << k)) && ((o.col_format >> (4 * k)) & 0xF)) {
                 const char* t = o.mrt_type[k] == OutType::Float ? "float4" : o.mrt_type[k] == OutType::Uint ? "uint4" : "int4";
-                src += std::string("    ") + t + " c" + N(k) + " [[color(" + N(k) + ")]];\n";
+                const std::string color_attribute =
+                    o.dual_source_blend && k == 1
+                        ? "[[color(0), index(1)]]"
+                        : "[[color(" + N(k) + ")]]";
+                src += std::string("    ") + t + " c" + N(k) + " " +
+                       color_attribute + ";\n";
             }
         }
         if (p.exports_depth && o.depth_target) {

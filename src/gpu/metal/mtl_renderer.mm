@@ -1198,6 +1198,12 @@ struct MetalRenderer::Impl {
                         u64 key) {
     std::vector<std::string> unsupported;
     std::string src = Shader::GenerateMsl(p, o, &unsupported);
+    if (trace && p.stage == Stage::Fragment && o.dual_source_blend) {
+      DC_INFO("gpu: dual-source MSL ps=%#llx mrt_mask=%#x col_format=%#x "
+              "secondary_output=%u",
+              p.address, p.mrt_mask, o.col_format,
+              src.find("[[color(0), index(1)]]") != std::string::npos);
+    }
     for (const auto &u : unsupported) {
       ReportOnce("shader op not translated: " + u);
     }
@@ -2774,6 +2780,27 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vs_key = Fnv(vs_types.data(), vs_types.size() * sizeof(TextureType), vs_key);
   u64 ps_key = 0;
   Shader::MslOptions fo;
+  const u32 blend0 = colors[0] ? r[Reg::CB_BLEND0_CONTROL] : 0;
+  const auto uses_source1 = [](u32 factor) {
+    return factor >= 15 && factor <= 18;
+  };
+  const bool source1_blend =
+      ((blend0 >> 30) & 1) &&
+      (uses_source1(blend0 & 0x1F) || uses_source1((blend0 >> 8) & 0x1F) ||
+       (((blend0 >> 29) & 1) &&
+        (uses_source1((blend0 >> 16) & 0x1F) ||
+         uses_source1((blend0 >> 24) & 0x1F))));
+  fo.dual_source_blend =
+      ps && (ps->mrt_mask & (1u << 1)) && source1_blend && !debug_fs &&
+      out_type[0] == OutType::Float &&
+      color_fmt[0] != MTLPixelFormatRGBA32Float;
+  if (trace && source1_blend) {
+    DC_INFO("gpu: source1 blend ps=%#llx blend0=%#x mrt_mask=%#x "
+            "col_format=%#x out0=%u format0=%u debug_fs=%u dual_source=%u",
+            ps_addr, blend0, ps ? ps->mrt_mask : 0, col_format,
+            static_cast<u32>(out_type[0]), static_cast<u32>(color_fmt[0]),
+            debug_fs != nil, fo.dual_source_blend);
+  }
   if (ps) {
     for (u32 k = 0; k < 32; ++k) {
       fo.ps_input_cntl[k] = r[Reg::SPI_PS_INPUT_CNTL_0 + k];
@@ -2796,6 +2823,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       fo.probe_y = probe.y;
     }
     ps_key = Hash(ps->hash);
+    ps_key = Hash(fo.dual_source_blend, ps_key);
     ps_key = Hash(fo.probe_pc, ps_key);
     ps_key = Hash(fo.depth_target, ps_key);
     ps_key = Hash(fo.depth_bounds, ps_key);
