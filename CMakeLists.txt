@@ -2,10 +2,17 @@ cmake_minimum_required(VERSION 3.24)
 
 project(DriveclubNative LANGUAGES C CXX OBJC OBJCXX)
 
+# Backends
+#   macOS:          this tree, Metal renderer (src/gpu/metal). Apple Silicon
+#                   runs the x86_64 build under Rosetta 2.
+#   Windows/Linux:  the DCport backend in windows/ (its own native runtime and
+#                   launcher, Vulkan); see windows/README.md. This tree's core
+#                   (src/core: loader, memory, signals, TLS) is macOS-only, so
+#                   it does not configure there.
 if (NOT APPLE)
-    # The renderer side is ready (DC_ENABLE_VULKAN), but the loader, memory
-    # manager, signals and TLS in src/core are still macOS/Mach-O specific.
-    message(FATAL_ERROR "Driveclub Native: the core (src/core) only runs on macOS for now")
+    message(FATAL_ERROR
+        "Driveclub Native: this tree (src/) builds the macOS backend only.\n"
+        "For Windows/Linux use the DCport backend: see windows/README.md.")
 endif()
 
 set(CMAKE_CXX_STANDARD 23)
@@ -26,21 +33,16 @@ execute_process(COMMAND sysctl -n hw.optional.arm64
 if (DC_HW_ARM64 STREQUAL "1")
     set(DC_APPLE_SILICON TRUE)
     message(STATUS "Apple Silicon host: building x86_64 for Rosetta 2")
-    # Libraries must be x86_64 too, so use the Intel Homebrew in /usr/local (install it and
-    # the dependencies through `arch -x86_64`, see README, "Apple Silicon").
+    # Libraries must be x86_64 too, so use Intel Homebrew in /usr/local.
     if (EXISTS /usr/local/Homebrew)
         list(PREPEND CMAKE_PREFIX_PATH /usr/local)
-        # Keep find_package from picking up the arm64 libraries in /opt/homebrew.
         list(APPEND CMAKE_IGNORE_PREFIX_PATH /opt/homebrew)
     else()
-        message(WARNING "No Intel Homebrew in /usr/local: SDL3 from /opt/homebrew is arm64 and "
-                        "will not link into this x86_64 build (see README, Apple Silicon)")
+        message(WARNING "No Intel Homebrew in /usr/local: dependencies must be installed as x86_64")
     endif()
 endif()
 
-# Instruction-set baseline for our own code. -march=native is wrong here: on Apple
-# Silicon it names an arm64 CPU, and Rosetta 2 only guarantees SSE4.2 (plus AVX/AVX2
-# on macOS 15 and later), so the default there is x86-64-v2.
+# Rosetta 2 guarantees x86-64-v2; -march=native would name the arm64 host CPU.
 if (DC_APPLE_SILICON)
     set(DC_HOST_MARCH_DEFAULT x86-64-v2)
 else()
@@ -51,10 +53,11 @@ set(DC_HOST_MARCH ${DC_HOST_MARCH_DEFAULT} CACHE STRING
 
 find_package(SDL3 REQUIRED CONFIG)
 
-# Zydis: the FS patcher (src/core/fs_patcher.cpp) decodes guest code with it.
+# Zydis: the FS patcher decodes guest code with it.
 include(cmake/Zydis.cmake)
 
-add_executable(driveclub
+# Platform core, HLE and the GPU front end (PM4, tiling, GCN decode).
+set(DC_CORE_SOURCES
     src/main.mm
     src/common/host.h
     src/common/log.h
@@ -90,17 +93,6 @@ add_executable(driveclub
     src/gpu/shader/gcn_decode.cpp
     src/gpu/shader/program.h
     src/gpu/shader/program.cpp
-    src/gpu/shader/msl.h
-    src/gpu/shader/msl.cpp
-    src/gpu/shader/msl_prelude.h
-    src/gpu/metal/mtl_device.h
-    src/gpu/metal/mtl_device.mm
-    src/gpu/metal/mtl_presenter.h
-    src/gpu/metal/mtl_presenter.mm
-    src/gpu/metal/mtl_formats.h
-    src/gpu/metal/mtl_renderer.h
-    src/gpu/metal/mtl_compiler.mm
-    src/gpu/metal/mtl_renderer.mm
     src/hle/hle.cpp
     src/hle/hle.h
     src/hle/kernel/kernel.cpp
@@ -145,6 +137,23 @@ add_executable(driveclub
     src/hle/nid_db.inc
 )
 
+# Metal renderer (macOS): GCN -> MSL translation and the Metal backend.
+set(DC_METAL_SOURCES
+    src/gpu/shader/msl.h
+    src/gpu/shader/msl.cpp
+    src/gpu/shader/msl_prelude.h
+    src/gpu/metal/mtl_device.h
+    src/gpu/metal/mtl_device.mm
+    src/gpu/metal/mtl_presenter.h
+    src/gpu/metal/mtl_presenter.mm
+    src/gpu/metal/mtl_formats.h
+    src/gpu/metal/mtl_renderer.h
+    src/gpu/metal/mtl_compiler.mm
+    src/gpu/metal/mtl_renderer.mm
+)
+
+add_executable(driveclub ${DC_CORE_SOURCES} ${DC_METAL_SOURCES})
+
 target_include_directories(driveclub PRIVATE src)
 
 target_compile_options(driveclub PRIVATE
@@ -153,18 +162,14 @@ target_compile_options(driveclub PRIVATE
     $<$<CONFIG:Release>:-O3 -march=${DC_HOST_MARCH}>
 )
 
-# The guest "user" range (64 GB up) is mapped by the kernel at exec time as the huge
-# GUEST_USER zero-fill segment. Rosetta 2 reserves [0xFC0000000, 0x7000000000) in every
-# translated process, so there the segment makes exec fail (the process is killed before
-# main): the range is off by default on Apple Silicon. Guests then only get the system
-# managed and system reserved areas (0 to 63 GB), which is where default allocations go.
+# Rosetta reserves part of the guest's high user range, so disable that segment
+# by default on Apple Silicon while keeping the existing Intel Mac layout.
 if (DC_APPLE_SILICON)
     set(DC_GUEST_USER_RANGE_DEFAULT OFF)
 else()
     set(DC_GUEST_USER_RANGE_DEFAULT ON)
 endif()
 option(DC_GUEST_USER_RANGE "Reserve the guest user range (64 GB and up)" ${DC_GUEST_USER_RANGE_DEFAULT})
-# End of that range (96 TB by default, as on Intel Macs).
 set(DC_GUEST_USER_MAX 0x600000000000 CACHE STRING "End of the guest user address range")
 if (DC_GUEST_USER_RANGE)
     target_compile_definitions(driveclub PRIVATE DC_GUEST_USER_MAX=${DC_GUEST_USER_MAX})
@@ -184,21 +189,6 @@ target_link_options(driveclub PRIVATE
 )
 if (DC_GUEST_USER_RANGE)
     target_link_options(driveclub PRIVATE -Wl,-segaddr,GUEST_USER,0x1000000000)
-endif()
-
-# Vulkan renderer (shadPS4's, third_party/shadps4): the Windows/Linux backend,
-# selectable on macOS too through MoltenVK with DC_RENDERER=vulkan.
-find_package(Vulkan QUIET)
-option(DC_ENABLE_VULKAN "Build the Vulkan renderer (shadPS4)" ${Vulkan_FOUND})
-if (DC_ENABLE_VULKAN)
-    include(cmake/ShadPS4Vulkan.cmake)
-    target_sources(driveclub PRIVATE
-        src/gpu/vulkan/vk_renderer.h
-        src/gpu/vulkan/vk_renderer.cpp
-        src/gpu/vulkan/dc_host.cpp)
-    target_include_directories(driveclub PRIVATE src/gpu/vulkan/bridge)
-    target_compile_definitions(driveclub PRIVATE DC_HAS_VULKAN=1)
-    target_link_libraries(driveclub PRIVATE dc_shadps4_vulkan Vulkan::Vulkan)
 endif()
 
 target_link_libraries(driveclub PRIVATE
