@@ -211,7 +211,6 @@ vertex V copy_vs(uint vid [[vertex_id]]) {
     o.pos = float4(o.uv.x * 2.0 - 1.0, 1.0 - o.uv.y * 2.0, 0.0, 1.0);
     return o;
 }
-fragment float4 debug_fs() { return float4(1.0, 0.0, 1.0, 1.0); }
 fragment float4 dump_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant float2& opt [[buffer(1)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
     float3 c = (opt.x != 0.0 ? float3(src.sample(s, in.uv).a) * 0.5 : src.sample(s, in.uv).rgb) * opt.y;
@@ -417,10 +416,9 @@ struct MetalRenderer::Impl {
       0; // DC_DUMP_TEXTURE=<addr>: write its uploads next to the frame dumps
   u64 debug_vsout = 0; // DC_DEBUG_VSOUT=<vs address>: dump its first positions
   id<MTLBuffer> debug_vs_buf = nil;
-  id<MTLFunction> debug_fs =
-      nil; // DC_DEBUG_FLAT: every pixel shader outputs magenta
   bool trace = false;
-  u64 trace_frame = 0; // DC_TRACE_FRAME=n: DC_GPU_TRACE for flip n only
+  u64 trace_frame = 0; // DC_TRACE_FRAME=n: first flip traced
+  u64 trace_frames = 1; // DC_TRACE_FRAMES: bounded number of flips to trace
   bool dump_passes =
       false; // DC_DUMP_PASSES: with DC_TRACE_FRAME, every pass's targets
   struct PassDump {
@@ -495,6 +493,9 @@ struct MetalRenderer::Impl {
     dump_passes = std::getenv("DC_DUMP_PASSES") != nullptr;
     if (const char *e = std::getenv("DC_TRACE_FRAME")) {
       trace_frame = std::strtoull(e, nullptr, 10);
+    }
+    if (const char *e = std::getenv("DC_TRACE_FRAMES")) {
+      trace_frames = std::max<u64>(1, std::strtoull(e, nullptr, 10));
     }
     if (const char *e = std::getenv("DC_DUMP_TEXTURE")) {
       dump_texture = std::strtoull(e, nullptr, 16);
@@ -581,9 +582,6 @@ struct MetalRenderer::Impl {
                                               options:nil
                                                 error:&err];
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    if (std::getenv("DC_DEBUG_FLAT")) {
-      debug_fs = [lib newFunctionWithName:@"debug_fs"];
-    }
     pd.vertexFunction = [lib newFunctionWithName:@"copy_vs"];
     pd.fragmentFunction = [lib newFunctionWithName:@"copy_fs"];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -2791,15 +2789,15 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         (uses_source1((blend0 >> 16) & 0x1F) ||
          uses_source1((blend0 >> 24) & 0x1F))));
   fo.dual_source_blend =
-      ps && (ps->mrt_mask & (1u << 1)) && source1_blend && !debug_fs &&
+      ps && (ps->mrt_mask & (1u << 1)) && source1_blend &&
       out_type[0] == OutType::Float &&
       color_fmt[0] != MTLPixelFormatRGBA32Float;
   if (trace && source1_blend) {
     DC_INFO("gpu: source1 blend ps=%#llx blend0=%#x mrt_mask=%#x "
-            "col_format=%#x out0=%u format0=%u debug_fs=%u dual_source=%u",
+            "col_format=%#x out0=%u format0=%u dual_source=%u",
             ps_addr, blend0, ps ? ps->mrt_mask : 0, col_format,
             static_cast<u32>(out_type[0]), static_cast<u32>(color_fmt[0]),
-            debug_fs != nil, fo.dual_source_blend);
+            fo.dual_source_blend);
   }
   if (ps) {
     for (u32 k = 0; k < 32; ++k) {
@@ -2872,7 +2870,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         // (shadPS4 swaps SrcAlpha factors for One/Zero).
         const bool alpha_masked =
             !((r[Reg::CB_SHADER_MASK] >> (4 * k + 3)) & 1);
-        if ((b >> 30) & 1 && blendable && !debug_fs) {
+        if ((b >> 30) & 1 && blendable) {
           ca.blendingEnabled = YES;
           auto fixa = [&](u32 f) {
             return !alpha_masked ? BlendFactor(f)
@@ -2901,16 +2899,15 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       pending.insert(pkey);
       std::string vsrc = MslSource(*vs, vo, vs_key);
       std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
-      const bool flat = debug_fs && ps && out_type[0] == OutType::Float;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
-                        vs_key, ps_key, pkey, flat, vs_addr, ps_addr] {
+                        vs_key, ps_key, pkey, vs_addr, ps_addr] {
         id<MTLRenderPipelineState> pso = nil;
         id<MTLFunction> vfn = compiler->Function(vs_key, vsrc, vs_addr);
         id<MTLFunction> ffn =
             fsrc.empty() ? nil : compiler->Function(ps_key, fsrc, ps_addr);
         if (vfn && (fsrc.empty() || ffn)) {
           d.vertexFunction = vfn;
-          d.fragmentFunction = flat ? debug_fs : ffn;
+          d.fragmentFunction = ffn;
           NSError *err = nil;
           const auto t0 = std::chrono::steady_clock::now();
           pso = [device newRenderPipelineStateWithDescriptor:d error:&err];
@@ -3538,7 +3535,8 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     }
   }
   if (trace_frame) {
-    trace = frame_count == trace_frame;
+    trace = frame_count >= trace_frame &&
+            frame_count - trace_frame < trace_frames;
   }
   if (stats) {
     const auto now = std::chrono::steady_clock::now();

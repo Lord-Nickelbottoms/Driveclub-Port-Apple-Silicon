@@ -1327,10 +1327,14 @@ void Emitter::EmitExp(const Inst& i) {
         return;
     }
     const u32 fmt = (o.col_format >> (4 * i.target)) & 0xF;
-    if (fmt == 0) {
+    const bool secondary_source = o.dual_source_blend && i.target == 1;
+    if (fmt == 0 && !secondary_source) {
         return;
     }
-    const OutType type = o.mrt_type[i.target];
+    // Dual-source blending takes the fragment shader's MRT1 export as source 1
+    // for color attachment 0. MRT1 itself is disabled, so its COL_FORMAT nibble
+    // is zero even though the shader export must still be present in Metal.
+    const OutType type = secondary_source ? o.mrt_type[0] : o.mrt_type[i.target];
     const std::string dst = "out.c" + N(i.target);
     // DC_PS_REG=<ps address hex>:<vgpr>: that shader exports vN..vN+2 instead (debugging)
     if (static const char* reg = std::getenv("DC_PS_REG"); reg && type == OutType::Float && i.target == 0) {
@@ -1715,8 +1719,11 @@ std::string Emitter::Run() {
         }
         src += "};\nstruct PsOut {\n";
         for (u32 k = 0; k < 8; ++k) {
-            if ((p.mrt_mask & (1u << k)) && ((o.col_format >> (4 * k)) & 0xF)) {
-                const char* t = o.mrt_type[k] == OutType::Float ? "float4" : o.mrt_type[k] == OutType::Uint ? "uint4" : "int4";
+            const bool secondary_source = o.dual_source_blend && k == 1;
+            if ((p.mrt_mask & (1u << k)) &&
+                (((o.col_format >> (4 * k)) & 0xF) || secondary_source)) {
+                const OutType type = secondary_source ? o.mrt_type[0] : o.mrt_type[k];
+                const char* t = type == OutType::Float ? "float4" : type == OutType::Uint ? "uint4" : "int4";
                 const std::string color_attribute =
                     o.dual_source_blend && k == 1
                         ? "[[color(0), index(1)]]"
